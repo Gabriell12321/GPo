@@ -1,0 +1,5 @@
+-cp src
+-main Main
+-hl bin/gpo.hl
+-lib heaps
+-lib hlsdl
