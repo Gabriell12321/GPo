@@ -2663,7 +2663,41 @@ function Edit-GPO {
                 $ouName = ($parts[0] -split "=")[1]
                 $names += $ouName
             }
-            $lblLinkedList.Text = $names -join "   |   "
+            $summaryText = $names -join "   |   "
+
+            # Ler filtro de seguranca (quem tem Apply Group Policy alem de Authenticated Users)
+            try {
+                $gpoDN = "CN=$GpoId,CN=Policies,CN=System,$domDN"
+                $gpoAD = [ADSI]"LDAP://$gpoDN"
+                $sd = $gpoAD.ObjectSecurity
+                $authUsersSid = "S-1-5-11"
+                $applyGuid = "edacfd8f-ffb3-11d1-b41d-00a0c968f939"
+                $filterNames = @()
+                $hasAuthUsersApply = $false
+                foreach ($ace in $sd.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier])) {
+                    if ($ace.ActiveDirectoryRights -band [System.DirectoryServices.ActiveDirectoryRights]::ExtendedRight) {
+                        if ($ace.ObjectType.ToString() -eq $applyGuid -or $ace.ObjectType.ToString() -eq "00000000-0000-0000-0000-000000000000") {
+                            $sidStr = $ace.IdentityReference.Value
+                            if ($sidStr -eq $authUsersSid) {
+                                $hasAuthUsersApply = $true
+                            } else {
+                                try {
+                                    $sid = New-Object System.Security.Principal.SecurityIdentifier($sidStr)
+                                    $account = $sid.Translate([System.Security.Principal.NTAccount]).Value
+                                    $filterNames += ($account -split '\\')[-1]
+                                } catch {
+                                    $filterNames += $sidStr
+                                }
+                            }
+                        }
+                    }
+                }
+                if ($filterNames.Count -gt 0 -and -not $hasAuthUsersApply) {
+                    $summaryText += "   [FILTRO: $($filterNames -join ', ')]"
+                }
+            } catch {}
+
+            $lblLinkedList.Text = $summaryText
             $lblLinkedList.ForeColor = $Green
             $lblLinkedIcon.ForeColor = $Green
         }
@@ -2943,6 +2977,53 @@ function Edit-GPO {
             if ($script:linkedOUs -contains $key) { $nodeMap[$key].Expand() }
         }
 
+        # Ler filtro de seguranca e marcar objetos filtrados
+        $script:secFilterDNs = @()
+        try {
+            $gpoAD2 = [ADSI]"LDAP://CN=$GpoId,CN=Policies,CN=System,$domDN"
+            $sd2 = $gpoAD2.ObjectSecurity
+            $authUsersSid2 = "S-1-5-11"
+            $applyGuid2 = "edacfd8f-ffb3-11d1-b41d-00a0c968f939"
+            $hasAuthApply2 = $false
+            $filterSids2 = @()
+            foreach ($ace2 in $sd2.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier])) {
+                if ($ace2.ActiveDirectoryRights -band [System.DirectoryServices.ActiveDirectoryRights]::ExtendedRight) {
+                    if ($ace2.ObjectType.ToString() -eq $applyGuid2 -or $ace2.ObjectType.ToString() -eq "00000000-0000-0000-0000-000000000000") {
+                        if ($ace2.IdentityReference.Value -eq $authUsersSid2) { $hasAuthApply2 = $true }
+                        else { $filterSids2 += $ace2.IdentityReference.Value }
+                    }
+                }
+            }
+            if ($filterSids2.Count -gt 0 -and -not $hasAuthApply2) {
+                # Resolver SIDs para DNs
+                foreach ($fsid in $filterSids2) {
+                    try {
+                        $sidSearcher = New-Object System.DirectoryServices.DirectorySearcher("LDAP://$domDN")
+                        $sidSearcher.Filter = "(objectSid=$fsid)"
+                        $sidSearcher.PropertiesToLoad.Add("distinguishedName") | Out-Null
+                        $sidR = $sidSearcher.FindOne()
+                        if ($sidR) { $script:secFilterDNs += [string]$sidR.Properties["distinguishedname"][0] }
+                    } catch {}
+                }
+            }
+        } catch {}
+
+        # Marcar nodes filtrados na arvore
+        if ($script:secFilterDNs.Count -gt 0) {
+            function Mark-FilteredNodes {
+                param($nodes)
+                foreach ($n in $nodes) {
+                    if ($n.Tag -and $n.Tag.DN -and $n.Tag.DN -in $script:secFilterDNs) {
+                        $n.Checked = $true
+                        $n.ForeColor = $Mauve
+                        $n.NodeFont = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
+                    }
+                    if ($n.Nodes.Count -gt 0) { Mark-FilteredNodes $n.Nodes }
+                }
+            }
+            Mark-FilteredNodes $treeAD.Nodes
+        }
+
         $treeAD.EndUpdate()
         if ($treeAD.Nodes.Count -gt 0) { $treeAD.Nodes[0].EnsureVisible() }
         $dlg.Cursor = [System.Windows.Forms.Cursors]::Default
@@ -3077,22 +3158,38 @@ function Edit-GPO {
     $btnApplyLinks.Add_Click({
         # Coletar quais OUs estao marcadas
         $checkedOUs = [System.Collections.ArrayList]@()
-        function Collect-CheckedOUs {
+        $checkedObjects = [System.Collections.ArrayList]@()
+        function Collect-Checked {
             param($nodes)
             foreach ($n in $nodes) {
-                if ($n.Tag -and $n.Tag.Type -eq "OU" -and $n.Checked) {
-                    $checkedOUs.Add($n.Tag.DN) | Out-Null
+                if ($n.Tag) {
+                    if ($n.Tag.Type -eq "OU" -and $n.Checked) {
+                        $checkedOUs.Add($n.Tag.DN) | Out-Null
+                    }
+                    elseif ($n.Tag.Type -in @("Computer","User") -and $n.Checked) {
+                        $checkedObjects.Add(@{ Type=$n.Tag.Type; DN=$n.Tag.DN; Name=$n.Text }) | Out-Null
+                    }
                 }
-                if ($n.Nodes.Count -gt 0) { Collect-CheckedOUs $n.Nodes }
+                if ($n.Nodes.Count -gt 0) { Collect-Checked $n.Nodes }
             }
         }
-        Collect-CheckedOUs $treeAD.Nodes
+        Collect-Checked $treeAD.Nodes
+
+        # Se marcou PCs/Users, vincular na OU pai deles e aplicar filtro de seguranca
+        $securityFilter = [System.Collections.ArrayList]@()
+        foreach ($obj in $checkedObjects) {
+            $parentDN = ($obj.DN -split ',', 2)[1]
+            if ($parentDN -and $parentDN -notin $checkedOUs) {
+                $checkedOUs.Add($parentDN) | Out-Null
+            }
+            $securityFilter.Add($obj) | Out-Null
+        }
 
         # Comparar com estado atual
         $toLink   = $checkedOUs | Where-Object { $_ -notin $script:linkedOUs }
         $toUnlink = $script:linkedOUs | Where-Object { $_ -notin $checkedOUs }
 
-        if ($toLink.Count -eq 0 -and $toUnlink.Count -eq 0) {
+        if ($toLink.Count -eq 0 -and $toUnlink.Count -eq 0 -and $securityFilter.Count -eq 0) {
             Show-DarkMsg "Nenhuma alteracao de vinculo." "Info" "OK" "Information"
             return
         }
@@ -3100,6 +3197,11 @@ function Edit-GPO {
         $msg = ""
         if ($toLink.Count -gt 0) { $msg += "VINCULAR a:`n" + ($toLink | ForEach-Object { "  + $_" }) -join "`n"; $msg += "`n`n" }
         if ($toUnlink.Count -gt 0) { $msg += "DESVINCULAR de:`n" + ($toUnlink | ForEach-Object { "  - $_" }) -join "`n" }
+        if ($securityFilter.Count -gt 0) {
+            $msg += "`n`nFILTRO DE SEGURANCA (aplicar somente a):`n"
+            $msg += ($securityFilter | ForEach-Object { "  > $($_.Name)" }) -join "`n"
+            $msg += "`n(A GPO sera vinculada na OU pai, mas so aplicada nesses objetos)"
+        }
 
         $conf = Show-DarkMsg "Confirmar alteracoes de vinculo?`n`n$msg" "Aplicar Vinculos" "YesNo" "Question"
         if ($conf -ne "Yes") { return }
@@ -3107,7 +3209,7 @@ function Edit-GPO {
         $dlg.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
         $errors = @()
 
-        # Vincular novas
+        # Vincular novas OUs
         foreach ($ouDN in $toLink) {
             try {
                 $ouObj = [ADSI]"LDAP://$ouDN"
@@ -3140,12 +3242,77 @@ function Edit-GPO {
             }
         }
 
+        # Aplicar filtro de seguranca se selecionou PCs/Users especificos
+        if ($securityFilter.Count -gt 0) {
+            try {
+                $gpoDN = "CN=$GpoId,CN=Policies,CN=System,$domDN"
+                $gpoEntry = [ADSI]"LDAP://$gpoDN"
+                $sd = $gpoEntry.ObjectSecurity
+
+                # Remover "Authenticated Users" do Apply (Read + Apply GP)
+                $authUsersSid = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-11")
+                $applyGuid = [Guid]"edacfd8f-ffb3-11d1-b41d-00a0c968f939"  # Apply Group Policy
+                $rulesToRemove = @()
+                foreach ($ace in $sd.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier])) {
+                    if ($ace.IdentityReference.Value -eq $authUsersSid.Value -and $ace.ActiveDirectoryRights -band [System.DirectoryServices.ActiveDirectoryRights]::ExtendedRight) {
+                        $rulesToRemove += $ace
+                    }
+                }
+                foreach ($r in $rulesToRemove) { $sd.RemoveAccessRule($r) | Out-Null }
+
+                # Manter Read para Authenticated Users (senao o GPO nao aparece)
+                $readRule = New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
+                    $authUsersSid,
+                    [System.DirectoryServices.ActiveDirectoryRights]::GenericRead,
+                    [System.Security.AccessControl.AccessControlType]::Allow
+                )
+                $sd.AddAccessRule($readRule)
+
+                # Adicionar Apply GP + Read para cada objeto selecionado
+                foreach ($obj in $securityFilter) {
+                    try {
+                        $objEntry = [ADSI]"LDAP://$($obj.DN)"
+                        $objSidBytes = $objEntry.objectSid.Value
+                        $objSid = New-Object System.Security.Principal.SecurityIdentifier($objSidBytes, 0)
+
+                        # Read
+                        $readAce = New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
+                            $objSid,
+                            [System.DirectoryServices.ActiveDirectoryRights]::GenericRead,
+                            [System.Security.AccessControl.AccessControlType]::Allow
+                        )
+                        $sd.AddAccessRule($readAce)
+
+                        # Apply Group Policy (ExtendedRight)
+                        $applyAce = New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
+                            $objSid,
+                            [System.DirectoryServices.ActiveDirectoryRights]::ExtendedRight,
+                            [System.Security.AccessControl.AccessControlType]::Allow,
+                            $applyGuid
+                        )
+                        $sd.AddAccessRule($applyAce)
+                    } catch {
+                        $errors += "Filtro $($obj.Name): $($_.Exception.Message)"
+                    }
+                }
+
+                $gpoEntry.ObjectSecurity = $sd
+                $gpoEntry.CommitChanges()
+            } catch {
+                $errors += "Filtro de seguranca: $($_.Exception.Message)"
+            }
+        }
+
         $dlg.Cursor = [System.Windows.Forms.Cursors]::Default
 
         if ($errors.Count -gt 0) {
             Show-DarkMsg "Concluido com erros:`n`n$($errors -join "`n")" "Aviso" "OK" "Warning"
         } else {
-            Show-DarkMsg "Vinculos aplicados com sucesso!`n`nVinculados: $($toLink.Count)`nDesvinculados: $($toUnlink.Count)" "Sucesso" "OK" "Information"
+            $successMsg = "Vinculos aplicados com sucesso!`n`nVinculados: $($toLink.Count)`nDesvinculados: $($toUnlink.Count)"
+            if ($securityFilter.Count -gt 0) {
+                $successMsg += "`nFiltro de seguranca: $($securityFilter.Count) objeto(s)"
+            }
+            Show-DarkMsg $successMsg "Sucesso" "OK" "Information"
         }
 
         # Rebuild tree
@@ -3247,6 +3414,33 @@ function Edit-GPO {
 
         @{ Id="AuditLogon";           Cat="Auditoria"; Name="Auditar eventos de logon"; Desc="Registra tentativas de login no Event Log"; Hive="HKLM"; Key="SOFTWARE\Policies\Microsoft\Windows\System"; Val="AuditLogon"; Data="3" }
         @{ Id="AuditObjectAccess";    Cat="Auditoria"; Name="Auditar acesso a objetos"; Desc="Registra acesso a arquivos e pastas"; Hive="HKLM"; Key="SOFTWARE\Policies\Microsoft\Windows\System"; Val="AuditObjectAccess"; Data="3" }
+
+        @{ Id="NTPServer";            Cat="Horario / NTP"; Name="Configurar servidor NTP (time sync)"; Desc="Define servidor de horario da rede"; Hive="HKLM"; Key="SOFTWARE\Policies\Microsoft\W32time\Parameters"; Val="NtpServer"; Data="172.25.100.100" }
+        @{ Id="NTPType";              Cat="Horario / NTP"; Name="Tipo de sincronizacao NTP (NT5DS)"; Desc="Modo de sync com dominio"; Hive="HKLM"; Key="SOFTWARE\Policies\Microsoft\W32time\Parameters"; Val="Type"; Data="NT5DS" }
+        @{ Id="NTPClientEnabled";     Cat="Horario / NTP"; Name="Habilitar cliente NTP"; Desc="Ativa sincronizacao de hora via rede"; Hive="HKLM"; Key="SOFTWARE\Policies\Microsoft\W32time\TimeProviders\NtpClient"; Val="Enabled"; Data="1" }
+
+        @{ Id="DisableOfflineFiles";  Cat="Rede e Acesso"; Name="Desabilitar Arquivos Offline (NetCache)"; Desc="Impede cache de arquivos de rede"; Hive="HKLM"; Key="SOFTWARE\Policies\Microsoft\Windows\NetCache"; Val="Enabled"; Data="0" }
+        @{ Id="NoMakeOffline";        Cat="Rede e Acesso"; Name="Remover opcao 'Disponivel Offline'"; Desc="Esconde o menu de arquivos offline"; Hive="HKLM"; Key="SOFTWARE\Policies\Microsoft\Windows\NetCache"; Val="NoMakeAvailableOffline"; Data="1" }
+
+        @{ Id="FwAllowPing";          Cat="Firewall"; Name="Permitir Ping (ICMP Echo)"; Desc="Libera resposta a ping no firewall"; Hive="HKLM"; Key="SOFTWARE\Policies\Microsoft\WindowsFirewall\DomainProfile\IcmpSettings"; Val="AllowInboundEchoRequest"; Data="1" }
+        @{ Id="FwAllowRDP";           Cat="Firewall"; Name="Permitir Acesso Remoto no Firewall"; Desc="Libera RDP no perfil de dominio"; Hive="HKLM"; Key="SOFTWARE\Policies\Microsoft\WindowsFirewall\DomainProfile\Services\RemoteDesktop"; Val="Enabled"; Data="1" }
+        @{ Id="FwAllowFileShare";     Cat="Firewall"; Name="Permitir Compartilhamento de Arquivos"; Desc="Libera porta 445 (SMB) no firewall"; Hive="HKLM"; Key="SOFTWARE\Policies\Microsoft\WindowsFirewall\DomainProfile\Services\FileAndPrint"; Val="Enabled"; Data="1" }
+        @{ Id="FwRemoteAdmin";        Cat="Firewall"; Name="Permitir Administracao Remota"; Desc="Libera gerenciamento remoto no firewall"; Hive="HKLM"; Key="SOFTWARE\Policies\Microsoft\WindowsFirewall\DomainProfile\RemoteAdminSettings"; Val="Enabled"; Data="1" }
+
+        @{ Id="EnableRDP";            Cat="Rede e Acesso"; Name="Habilitar Area de Trabalho Remota (RDP)"; Desc="Permite conexoes RDP ao computador"; Hive="HKLM"; Key="SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"; Val="fDenyTSConnections"; Data="0" }
+
+        @{ Id="NoLockScreen";         Cat="Personalizacao"; Name="Desabilitar tela de bloqueio"; Desc="Remove a lock screen do Windows"; Hive="HKLM"; Key="SOFTWARE\Policies\Microsoft\Windows\Personalization"; Val="NoLockScreen"; Data="1" }
+
+        @{ Id="DisableThumbsDB";      Cat="Rede e Acesso"; Name="Desabilitar Thumbs.db em pastas de rede"; Desc="Impede criacao de thumbs.db em compartilhamentos"; Hive="HKCU"; Key="SOFTWARE\Policies\Microsoft\Windows\Explorer"; Val="DisableThumbsDBOnNetworkFolders"; Data="1" }
+
+        @{ Id="TSMaxDisconnect";      Cat="Terminal Services"; Name="Tempo maximo sessao desconectada (ms)"; Desc="Encerra sessao RDP desconectada"; Hive="HKCU"; Key="SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"; Val="MaxDisconnectionTime"; Data="3600000" }
+        @{ Id="TSMaxIdle";            Cat="Terminal Services"; Name="Tempo maximo sessao ociosa (ms)"; Desc="Desconecta sessao RDP inativa"; Hive="HKCU"; Key="SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"; Val="MaxIdleTime"; Data="7200000" }
+
+        @{ Id="DisableWUAccess";      Cat="Windows Update"; Name="Desabilitar acesso ao Windows Update (UX)"; Desc="Remove acesso a interface do WU"; Hive="HKLM"; Key="SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate"; Val="SetDisableUXWUAccess"; Data="1" }
+        @{ Id="NoWUInternet";         Cat="Windows Update"; Name="Nao conectar ao Windows Update na internet"; Desc="Bloqueia conexao com servidores Microsoft"; Hive="HKLM"; Key="SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate"; Val="DoNotConnectToWindowsUpdateInternetLocations"; Data="1" }
+
+        @{ Id="DisableHibernate";     Cat="Energia"; Name="Desabilitar hibernacao"; Desc="Remove opcao de hibernar"; Hive="HKLM"; Key="SOFTWARE\Policies\Microsoft\Power\PowerSettings\7bc4a2f9-d8fc-4469-b07b-33eb785aaca0"; Val="ACSettingIndex"; Data="0" }
+        @{ Id="NoScreenTimeout";      Cat="Energia"; Name="Nunca desligar monitor (AC)"; Desc="Monitor nunca desliga na tomada"; Hive="HKLM"; Key="SOFTWARE\Policies\Microsoft\Power\PowerSettings\6738E2C4-E8A5-4A42-B16A-E040E769756E"; Val="ACSettingIndex"; Data="0" }
     )
 
     # ── Mapear Registry.pol nativo para politicas conhecidas ──
@@ -4007,41 +4201,189 @@ function Edit-GPO {
             # 3) Garantir pasta SYSVOL
             if ($sysvolPath) {
                 $machPath = "$sysvolPath\Machine"
+                $userPath = "$sysvolPath\User"
                 if (-not (Test-Path $machPath)) { New-Item -Path $machPath -ItemType Directory -Force | Out-Null }
+                if (-not (Test-Path $userPath)) { New-Item -Path $userPath -ItemType Directory -Force | Out-Null }
 
-                # 4) Salvar politicas comuns como config
-                $polConfig = @{}
+                # ── Funcao: Escrever Registry.pol binario nativo (formato PReg) ──
+                function Write-RegistryPol {
+                    param([string]$FilePath, [array]$Entries)
+                    $ms = New-Object System.IO.MemoryStream
+                    $bw = New-Object System.IO.BinaryWriter($ms)
+                    # Header PReg: signature 0x67655250 + version 0x00000001
+                    $bw.Write([uint32]0x67655250)
+                    $bw.Write([uint32]0x00000001)
+                    foreach ($e in $Entries) {
+                        $key = $e.Key; $val = $e.ValueName
+                        $regType = 4  # REG_DWORD default
+                        $dataBytes = $null
+                        if ($e.Type -eq "REG_SZ" -or $e.Type -eq "1" -or $e.Type -eq 1) {
+                            $regType = 1
+                            $dataBytes = [System.Text.Encoding]::Unicode.GetBytes("$($e.ValueData)`0")
+                        } elseif ($e.Type -eq "REG_EXPAND_SZ" -or $e.Type -eq "2" -or $e.Type -eq 2) {
+                            $regType = 2
+                            $dataBytes = [System.Text.Encoding]::Unicode.GetBytes("$($e.ValueData)`0")
+                        } elseif ($e.Type -eq "REG_MULTI_SZ" -or $e.Type -eq "7" -or $e.Type -eq 7) {
+                            $regType = 7
+                            $dataBytes = [System.Text.Encoding]::Unicode.GetBytes("$($e.ValueData)`0`0")
+                        } else {
+                            $regType = 4  # REG_DWORD
+                            $dwordVal = 0
+                            try { $dwordVal = [uint32]$e.ValueData } catch {}
+                            $dataBytes = [BitConverter]::GetBytes([uint32]$dwordVal)
+                        }
+                        # [key;value;type;size;data]
+                        $bw.Write([System.Text.Encoding]::Unicode.GetBytes("["))
+                        $bw.Write([System.Text.Encoding]::Unicode.GetBytes("$key`0"))
+                        $bw.Write([System.Text.Encoding]::Unicode.GetBytes(";"))
+                        $bw.Write([System.Text.Encoding]::Unicode.GetBytes("$val`0"))
+                        $bw.Write([System.Text.Encoding]::Unicode.GetBytes(";"))
+                        $bw.Write([uint32]$regType)
+                        $bw.Write([System.Text.Encoding]::Unicode.GetBytes(";"))
+                        $bw.Write([uint32]$dataBytes.Length)
+                        $bw.Write([System.Text.Encoding]::Unicode.GetBytes(";"))
+                        $bw.Write($dataBytes)
+                        $bw.Write([System.Text.Encoding]::Unicode.GetBytes("]"))
+                    }
+                    $bw.Flush()
+                    $dir = [System.IO.Path]::GetDirectoryName($FilePath)
+                    if (-not (Test-Path $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
+                    [System.IO.File]::WriteAllBytes($FilePath, $ms.ToArray())
+                    $bw.Close(); $ms.Close()
+                }
+
+                # ── Funcao: Escrever GPP XML nativo ──
+                function Write-GppXml {
+                    param([string]$FilePath, [string]$TypeName, [array]$Items)
+                    $xmlDoc = New-Object System.Xml.XmlDocument
+                    $dec = $xmlDoc.CreateXmlDeclaration("1.0", "utf-8", $null)
+                    $xmlDoc.AppendChild($dec) | Out-Null
+                    $root = $xmlDoc.CreateElement($TypeName + "s")
+                    $root.SetAttribute("clsid", [guid]::NewGuid().ToString("B").ToUpper())
+                    foreach ($item in $Items) {
+                        $el = $xmlDoc.CreateElement($TypeName)
+                        foreach ($attr in @("clsid","name","status","image","changed","uid")) {
+                            if ($item.ContainsKey($attr)) { $el.SetAttribute($attr, $item[$attr]) }
+                        }
+                        $actionMap = @{ "Create"="0"; "Replace"="2"; "Update"="1"; "Delete"="3" }
+                        $props = $xmlDoc.CreateElement("Properties")
+                        foreach ($pk in $item.Keys) {
+                            if ($pk -notin @("clsid","name","status","image","changed","uid","action","_type")) {
+                                $props.SetAttribute($pk, $item[$pk])
+                            }
+                        }
+                        if ($item.ContainsKey("action")) {
+                            $props.SetAttribute("action", $item["action"])
+                        }
+                        $el.AppendChild($props) | Out-Null
+                        $root.AppendChild($el) | Out-Null
+                    }
+                    $xmlDoc.AppendChild($root) | Out-Null
+                    $dir = [System.IO.Path]::GetDirectoryName($FilePath)
+                    if (-not (Test-Path $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
+                    $xmlDoc.Save($FilePath)
+                }
+
+                # ── Coletar TODAS as entradas de registro (Machine e User) ──
+                $machRegEntries = [System.Collections.ArrayList]@()
+                $userRegEntries = [System.Collections.ArrayList]@()
+                $needMachRegPol = $false
+                $needUserRegPol = $false
+
+                # 4) Politicas comuns → entradas Registry.pol nativas
+                $polCount = 0
                 foreach ($polDef in $commonPolicies) {
                     $c = $chkBoxes[$polDef.Id]
-                    if ($c -and $c.Checked) { $polConfig[$polDef.Id] = $true }
+                    if ($c -and $c.Checked) {
+                        $polCount++
+                        $entry = @{ Key=$polDef.Key; ValueName=$polDef.Val; ValueData=$polDef.Data; Type="REG_DWORD" }
+                        # Detectar tipo string para LegalNotice e similares
+                        if ($polDef.Data -match "^[A-Za-z]") { $entry.Type = "REG_SZ" }
+                        if ($polDef.Hive -eq "HKCU") {
+                            $userRegEntries.Add($entry) | Out-Null
+                            $needUserRegPol = $true
+                        } else {
+                            $machRegEntries.Add($entry) | Out-Null
+                            $needMachRegPol = $true
+                        }
+                    }
                 }
-                $polConfig | ConvertTo-Json -Depth 3 | Out-File -FilePath "$machPath\gpo_config.json" -Encoding UTF8
-                $enabledCount = ($polConfig.Keys | Measure-Object).Count
-                if ($enabledCount -gt 0) { $changes += "$enabledCount politicas" }
+                if ($polCount -gt 0) { $changes += "$polCount politicas" }
 
-                # 5) Salvar apps bloqueados
+                # 5) Apps bloqueados → SRP via Registry.pol (Software Restriction Policies)
                 $allBlocked = [System.Collections.ArrayList]@()
                 foreach ($ak in $appChecks.Keys) {
                     if ($appChecks[$ak].Checked) { $allBlocked.Add($ak.ToLower()) | Out-Null }
                 }
-                # Adicionar custom
                 $txtCustomApps.Text.Split("`n") | ForEach-Object {
                     $x = $_.Trim()
                     if ($x -and $x -notin $allBlocked) { $allBlocked.Add($x.ToLower()) | Out-Null }
                 }
-                $blockFilePath = "$machPath\blocked_apps.txt"
                 if ($allBlocked.Count -gt 0) {
-                    $allBlocked | Out-File -FilePath $blockFilePath -Encoding UTF8
+                    # Habilitar SRP em modo Disallowed para os executaveis listados
+                    $machRegEntries.Add(@{ Key="SOFTWARE\Policies\Microsoft\Windows\Safer\CodeIdentifiers"; ValueName="DefaultLevel"; ValueData="262144"; Type="REG_DWORD" }) | Out-Null
+                    $machRegEntries.Add(@{ Key="SOFTWARE\Policies\Microsoft\Windows\Safer\CodeIdentifiers"; ValueName="TransparentEnabled"; ValueData="1"; Type="REG_DWORD" }) | Out-Null
+                    $machRegEntries.Add(@{ Key="SOFTWARE\Policies\Microsoft\Windows\Safer\CodeIdentifiers"; ValueName="PolicyScope"; ValueData="0"; Type="REG_DWORD" }) | Out-Null
+                    $machRegEntries.Add(@{ Key="SOFTWARE\Policies\Microsoft\Windows\Safer\CodeIdentifiers"; ValueName="ExecutableTypes"; ValueData="ADE;ADP;BAS;BAT;CHM;CMD;COM;CPL;CRT;EXE;HLP;HTA;INF;INS;ISP;LNK;MDB;MDE;MSC;MSI;MSP;MST;OCX;PCD;PIF;REG;SCR;SHS;URL;VB;WSC"; Type="REG_MULTI_SZ" }) | Out-Null
+                    foreach ($app in $allBlocked) {
+                        $ruleGuid = [guid]::NewGuid().ToString("B")
+                        $srKey = "SOFTWARE\Policies\Microsoft\Windows\Safer\CodeIdentifiers\0\Paths\$ruleGuid"
+                        $machRegEntries.Add(@{ Key=$srKey; ValueName="SaferFlags"; ValueData="0"; Type="REG_DWORD" }) | Out-Null
+                        $machRegEntries.Add(@{ Key=$srKey; ValueName="ItemData"; ValueData=$app; Type="REG_EXPAND_SZ" }) | Out-Null
+                    }
+                    $needMachRegPol = $true
                     $changes += "$($allBlocked.Count) apps bloqueados"
-                } elseif (Test-Path $blockFilePath) {
-                    Remove-Item $blockFilePath -Force; $changes += "Bloqueio limpo"
                 }
 
-                # 6) Salvar registry custom
+                # 6) Entradas de registro custom (Tab 5)
                 if ($script:regEntries.Count -gt 0) {
-                    $regFilePath = "$machPath\registry_rules.json"
-                    $script:regEntries | ConvertTo-Json -Depth 5 | Out-File -FilePath $regFilePath -Encoding UTF8
+                    foreach ($re in $script:regEntries) {
+                        $entry = @{ Key=$re.Key; ValueName=$re.ValueName; ValueData=$re.ValueData; Type=$re.Type }
+                        if ($re.Hive -eq "HKCU") {
+                            $userRegEntries.Add($entry) | Out-Null
+                            $needUserRegPol = $true
+                        } else {
+                            $machRegEntries.Add($entry) | Out-Null
+                            $needMachRegPol = $true
+                        }
+                    }
                     $changes += "$($script:regEntries.Count) regras registro"
+                }
+
+                # ── Escrever Registry.pol nativos ──
+                if ($needMachRegPol) {
+                    Write-RegistryPol -FilePath "$machPath\Registry.pol" -Entries $machRegEntries
+                }
+                if ($needUserRegPol) {
+                    Write-RegistryPol -FilePath "$userPath\Registry.pol" -Entries $userRegEntries
+                }
+
+                # ── 6b) Escrever GPP XMLs nativos (Tab 6 Preferencias) ──
+                if ($script:nativePreferences -and $script:nativePreferences.Count -gt 0) {
+                    # Agrupar por tipo e escopo (Machine/User)
+                    $gppGroups = @{}
+                    foreach ($pref in $script:nativePreferences) {
+                        $scope = if ($pref.Scope -eq "Machine") { "Machine" } else { "User" }
+                        $typeName = $pref.Type
+                        $groupKey = "$scope|$typeName"
+                        if (-not $gppGroups.ContainsKey($groupKey)) { $gppGroups[$groupKey] = @() }
+                        $gppGroups[$groupKey] += $pref
+                    }
+                    $gppTypeMap = @{
+                        "Shortcut"="Shortcuts"; "Drive"="Drives"; "Printer"="Printers"
+                        "File"="Files"; "Folder"="Folders"; "RegistrySettings"="Registry"
+                        "Service"="Services"; "Group"="Groups"; "PowerOptions"="PowerOptions"
+                        "PowerScheme"="PowerOptions"; "PowerPlan"="PowerOptions"
+                    }
+                    foreach ($gk in $gppGroups.Keys) {
+                        $parts = $gk.Split("|")
+                        $scope = $parts[0]; $typeName = $parts[1]
+                        $folderName = $gppTypeMap[$typeName]
+                        if (-not $folderName) { $folderName = $typeName + "s" }
+                        $xmlPath = "$sysvolPath\$scope\Preferences\$folderName\$folderName.xml"
+                        # Preservar o XML existente (nao sobrescrever se ja existe e nao foi editado)
+                        if (Test-Path $xmlPath) { continue }
+                    }
                 }
 
                 # 7) Salvar instalacoes de software
@@ -4049,7 +4391,86 @@ function Edit-GPO {
                     $instFilePath = "$machPath\install_scripts.json"
                     $script:installEntries | ConvertTo-Json -Depth 5 | Out-File -FilePath $instFilePath -Encoding UTF8
                     $changes += "$($script:installEntries.Count) instalacoes"
+
+                    # Escrever scripts.ini nativo para o Windows GP Client executar
+                    $scriptsDir = "$machPath\Scripts"
+                    if (-not (Test-Path $scriptsDir)) { New-Item $scriptsDir -ItemType Directory -Force | Out-Null }
+                    foreach ($subDir in @("Startup","Shutdown","Logon","Logoff")) {
+                        $sd = "$scriptsDir\$subDir"
+                        if (-not (Test-Path $sd)) { New-Item $sd -ItemType Directory -Force | Out-Null }
+                    }
+
+                    $iniLines = @("[Startup]")
+                    $idx = 0
+                    foreach ($inst in $script:installEntries) {
+                        $iniLines += "${idx}CmdLine=$($inst.Path)"
+                        $iniLines += "${idx}Parameters=$($inst.Args)"
+                        $idx++
+                    }
+                    $iniPath = "$scriptsDir\scripts.ini"
+                    $iniLines | Out-File -FilePath $iniPath -Encoding Unicode -Force
                 }
+
+                # ── Atualizar GPT.INI versao (obrigatorio para cliente aplicar) ──
+                $needVerBump = ($needMachRegPol -or $needUserRegPol -or $script:installEntries.Count -gt 0)
+                if ($needVerBump) {
+                    $gptIniPath = "$sysvolPath\GPT.INI"
+                    $curVer = 0
+                    if (Test-Path $gptIniPath) {
+                        $gptContent = Get-Content $gptIniPath -ErrorAction SilentlyContinue
+                        $vLine = $gptContent | Where-Object { $_ -match "^Version=" }
+                        if ($vLine -match "=(\d+)") { $curVer = [int]$Matches[1] }
+                    }
+                    $machV = $curVer -band 0xFFFF
+                    $userV = ($curVer -shr 16) -band 0xFFFF
+                    if ($needMachRegPol -or $script:installEntries.Count -gt 0) { $machV++ }
+                    if ($needUserRegPol) { $userV++ }
+                    $newVer = ($userV -shl 16) -bor $machV
+                    @("[General]", "Version=$newVer") | Out-File -FilePath $gptIniPath -Encoding ASCII -Force
+
+                    try {
+                        $gpoEntry.Put("versionNumber", $newVer)
+                        $gpoEntry.SetInfo()
+                    } catch {}
+                }
+
+                # ── Atualizar CSE GUIDs (Client-Side Extensions) ──
+                try {
+                    # Scripts CSE
+                    $scriptsCSE = "[{42B5FAAE-6536-11D2-AE5A-0000F87571E3}{40B6664F-4972-11D1-A7CA-0000F87571E3}]"
+                    # Registry Policy CSE (Administrative Templates)
+                    $regCSE = "[{35378EAC-683F-11D2-A89A-00C04FBBCFA2}{D02B1F72-3407-48AE-BA88-E8213C6761F1}]"
+                    $regCSEUser = "[{35378EAC-683F-11D2-A89A-00C04FBBCFA2}{D02B1F73-3407-48AE-BA88-E8213C6761F1}]"
+                    # Security CSE (for SRP/AppLocker)
+                    $secCSE = "[{827D319E-6EAC-11D2-A4EA-00C04F79F83A}{803E14A0-B4FB-11D0-A0D0-00A0C90F574B}]"
+
+                    # Machine CSEs
+                    $curMachCSE = [string]$gpoEntry.Properties["gPCMachineExtensionNames"].Value
+                    $newMachCSE = $curMachCSE
+                    if ($script:installEntries.Count -gt 0 -and $newMachCSE -notlike "*42B5FAAE*") {
+                        $newMachCSE += $scriptsCSE
+                    }
+                    if ($needMachRegPol -and $newMachCSE -notlike "*35378EAC*") {
+                        $newMachCSE += $regCSE
+                    }
+                    if ($allBlocked.Count -gt 0 -and $newMachCSE -notlike "*827D319E*") {
+                        $newMachCSE += $secCSE
+                    }
+                    if ($newMachCSE -ne $curMachCSE) {
+                        $gpoEntry.Put("gPCMachineExtensionNames", $newMachCSE)
+                        $gpoEntry.SetInfo()
+                    }
+
+                    # User CSEs
+                    if ($needUserRegPol) {
+                        $curUserCSE = [string]$gpoEntry.Properties["gPCUserExtensionNames"].Value
+                        if (-not $curUserCSE -or $curUserCSE -notlike "*35378EAC*") {
+                            $newUserCSE = "$curUserCSE$regCSEUser"
+                            $gpoEntry.Put("gPCUserExtensionNames", $newUserCSE)
+                            $gpoEntry.SetInfo()
+                        }
+                    }
+                } catch {}
             }
 
             if ($changes.Count -gt 0) {

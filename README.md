@@ -26,11 +26,11 @@ O GPO Manager oferece uma interface completa para administradores de rede criare
 
 **Geral** — Nome, descricao, status e propriedades detalhadas da GPO (GUID, DN, caminho SYSVOL, versoes, datas, CSEs).
 
-**Aplicar a (AD)** — TreeView com checkboxes para vincular e desvincular OUs, com resumo das OUs vinculadas no topo.
+**Aplicar a (AD)** — TreeView com checkboxes para vincular e desvincular OUs. Suporte a filtro de seguranca por objeto individual (PC ou usuario), exibindo objetos filtrados em destaque (Mauve/negrito) com resumo "[FILTRO: nome]" no topo.
 
-**Politicas Comuns** — Politicas pre-configuradas organizadas por categoria, ativaveis por checkbox. Detecta automaticamente politicas ja aplicadas via Registry.pol nativo do GPMC.
+**Politicas Comuns** — Mais de 50 politicas pre-configuradas organizadas por categoria (Restricoes, Personalizacao, Dispositivos, Windows Update, Rede, Firewall, Seguranca, Login, Energia, NTP/Horario, Terminal Services, Auditoria), ativaveis por checkbox. Detecta automaticamente politicas ja aplicadas via Registry.pol nativo do GPMC.
 
-**Bloqueio de Apps** — Lista de aplicativos para bloqueio com integracao ao cadastro de apps e campo para adicao personalizada.
+**Bloqueio de Apps** — Lista de aplicativos para bloqueio via Software Restriction Policies (SRP) nativas do Windows, com integracao ao cadastro de apps e campo para adicao personalizada.
 
 **Scripts / Instalacao** — Gerenciamento de scripts de inicializacao e instalacao de software, com deteccao automatica de scripts nativos (scripts.ini) e pacotes MSI do SYSVOL. Secao de registro avancado para regras customizadas.
 
@@ -108,11 +108,14 @@ A interface utiliza o esquema de cores Catppuccin Mocha com as seguintes caracte
 
 ## Armazenamento
 
-As configuracoes de politicas de cada GPO sao salvas na pasta SYSVOL do dominio, dentro da estrutura padrao de cada GPO:
+As configuracoes sao salvas diretamente nos formatos nativos do Windows Group Policy dentro da pasta SYSVOL:
 
-- `gpo_config.json` — Politicas comuns selecionadas
-- `blocked_apps.txt` — Lista de aplicativos bloqueados
-- `registry_rules.json` — Regras de registro customizadas
+- `Machine\Registry.pol` / `User\Registry.pol` — Politicas de registro no formato binario PReg nativo (lido pelo GP Client do Windows)
+- `Machine\Scripts\scripts.ini` — Scripts de inicializacao no formato Unicode nativo
+- `GPT.INI` — Versao da GPO (Machine/User bits) incrementada automaticamente
+- `gPCMachineExtensionNames` / `gPCUserExtensionNames` — CSE GUIDs atualizados no AD (Administrative Templates, Scripts, Security)
+- Software Restriction Policies (SRP) — Apps bloqueados gravados como regras nativas no Registry.pol
+- Filtro de seguranca — ACLs de Apply Group Policy por objeto (PC/Usuario individual)
 
 Arquivos locais como `apps_db.json` e `gpo_settings.json` sao ignorados pelo controle de versao.
 
