@@ -1,0 +1,39 @@
+{
+    "Machines":  {
+                     "PC-RECEPCAO":  [
+                                         "chrome"
+                                     ],
+                     "PC-16":  [
+                                   "calc",
+                                   "calculatorapp",
+                                   "mspaint",
+                                   "paintapp",
+                                   "notepad",
+                                   "notepadapp",
+                                   "discord",
+                                   "telegram",
+                                   "steam",
+                                   "epicgameslauncher"
+                               ],
+                     "PC-12":  [
+                                   "calc",
+                                   "calculatorapp",
+                                   "mspaint",
+                                   "charmap",
+                                   "discord",
+                                   "telegram",
+                                   "steam",
+                                   "epicgameslauncher"
+                               ],
+                     "PC-FINANCEIRO":  [
+                                           "whatsapp",
+                                           "spotify"
+                                       ]
+                 },
+    "Global":  [
+                   "steam",
+                   "epicgameslauncher",
+                   "discord",
+                   "telegram"
+               ]
+}

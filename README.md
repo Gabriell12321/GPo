@@ -1,10 +1,32 @@
-# GPO Manager
+# GPO Manager + WinSysMon
 
-Ferramenta grafica para gerenciamento de Group Policy Objects (GPOs) do Active Directory, desenvolvida em PowerShell com interface WinForms e tema escuro Catppuccin.
+Suite completa para gerenciamento de Group Policy Objects (GPOs) do Active Directory **e** enforcement de bloqueio de aplicativos em tempo real via serviço Windows nativo distribuído por GPO.
+
+Composta por dois módulos integrados:
+
+1. **GPO Manager** — Interface gráfica (PowerShell + WinForms) para criar, editar e distribuir GPOs com tema Catppuccin Mocha.
+2. **WinSysMon** — Agente em PowerShell compilado como serviço Windows real (C# wrapper) que roda como SYSTEM em cada estação, lê lista de apps bloqueados de um share UNC e mata processos instantaneamente via WMI event subscription.
+
+## Arquitetura
+
+```
+┌────────────────────────┐      ┌───────────────────────────────┐      ┌──────────────────┐
+│   ADMIN (GPO Manager)  │      │   SHARE DE REDE (srv-105)     │      │   ESTAÇÕES       │
+│   + Haxe UI "Bloquear  │─────▶│   \\srv-105\...\gpo\aaa\      │◀─────│   WinSysMon      │
+│     Apps"              │ save │   ├─ PARAGPOAA.BAT (GPO boot) │ read │   (serviço)      │
+│                        │      │   └─ service\                 │      │   polling 30s    │
+│                        │      │      ├─ winsysmon.ps1         │      │   + WMI instant  │
+│                        │      │      ├─ install-service.ps1   │      │                  │
+│                        │      │      ├─ blocked-apps.json     │      │                  │
+│                        │      │      └─ sysmon-config.json    │      │                  │
+└────────────────────────┘      └───────────────────────────────┘      └──────────────────┘
+```
 
 ## Visao Geral
 
 O GPO Manager oferece uma interface completa para administradores de rede criarem, editarem, duplicarem, exportarem e importarem GPOs sem depender do console GPMC tradicional. Toda a comunicacao com o Active Directory e feita via LDAP/ADSI nativo, dispensando modulos RSAT adicionais.
+
+O módulo WinSysMon estende essa suite adicionando **enforcement em tempo real**: enquanto o GPMC aplica SRP que atua apenas no login, o WinSysMon é um serviço Windows permanente que detecta e mata processos bloqueados em < 1 segundo (via WMI `__InstanceCreationEvent WITHIN 1`).
 
 ## Funcionalidades
 
@@ -49,6 +71,99 @@ Assistente passo a passo para criacao simplificada de GPOs com selecao de politi
 
 Catalogo local de aplicativos (nome, executavel, categoria e descricao) armazenado em JSON, integrado ao editor de bloqueio de apps.
 
+---
+
+## WinSysMon — Serviço de Enforcement
+
+Agente em PowerShell encapsulado em serviço Windows nativo (wrapper C# compilado inline com `csc.exe`). Aparece em `services.msc` como **Windows System Monitor**, roda como SYSTEM, oculto do usuário comum.
+
+### Componentes
+
+| Arquivo | Função |
+|---------|--------|
+| `service/winsysmon.ps1` | Loop principal: WMI watcher + polling + logs + notificações |
+| `service/install-service.ps1` | Compila o wrapper C# e registra o serviço |
+| `service/blocked-apps.json` | Lista central no share: Global + por máquina |
+| `service/sysmon-config.json` | Config do agente (PollInterval, SharePath, etc.) |
+| `PARAGPOAA.BAT` | Script de Computer Startup da GPO (roda como SYSTEM) |
+| `INSTALAR.BAT` | Instalador manual com auto-elevação UAC |
+| `scripts/bridge.ps1` | Bridge usada pela UI Haxe para ler/gravar no share |
+| `src/Main.hx` | UI Haxe/Heaps para o admin (login → lista PCs → checkboxes) |
+
+### Formato de `blocked-apps.json`
+
+```json
+{
+    "Global": ["steam", "epicgameslauncher", "discord", "telegram"],
+    "Machines": {
+        "PC-12": ["calc", "calculatorapp", "mspaint", "notepad"],
+        "PC-16": ["calc", "paintapp", "notepadapp"],
+        "PC-RECEPCAO": ["chrome"]
+    }
+}
+```
+
+Cada agente lê `Global + Machines[COMPUTERNAME]` e mata qualquer processo que dê match por nome, caminho ou wildcard.
+
+### Recursos de Robustez (v1.1.0)
+
+- **Detecção instantânea** via `Register-WmiEvent __InstanceCreationEvent WITHIN 1` — processos são mortos em < 1 segundo após `Process.Start()`
+- **Polling de reforço** a cada 1s como fallback caso WMI falhe
+- **Self-healing WMI**: detecta se a subscription morreu e re-registra automaticamente
+- **Cache local em disco** (`patterns-cache.json`): agente continua bloqueando mesmo se o share cair
+- **Rate-limiting de notificações**: toast "App bloqueado" limitado a 1/60s por processo
+- **Rotação de log**: `sysmon.log` > 5MB é renomeado para `.old`
+- **Watchdog C#** com backoff exponencial: se o PowerShell cair em < 30s repetidas vezes, aumenta o delay até 5min
+- **Heartbeat** a cada 5min no log para confirmar vida
+- **Fallback `taskkill.exe`** quando `Stop-Process` bate em Access Denied
+- **ACL via SID** (`LocalSystemSid`, `BuiltinAdministratorsSid`) — funciona em qualquer idioma do Windows
+- **ACL SDDL no serviço** e na pasta: apenas SYSTEM e Administrators têm controle total
+- **Serviço configurado com recovery**: `sc failure ... actions=restart/5000/restart/10000/restart/30000`
+
+### Deployment por GPO
+
+1. Copiar todo o conteúdo do projeto para `\\srv-105\Sistema de monitoramento\gpo\aaa\`
+2. Garantir permissões de leitura no share SMB + NTFS para `Authenticated Users` ou `Domain Computers`
+3. Criar GPO "windy" vinculada à OU das estações
+4. **Computer Configuration → Policies → Windows Settings → Scripts → Startup** → Adicionar `\\srv-105\Sistema de monitoramento\gpo\aaa\PARAGPOAA.BAT`
+5. **Computer Configuration → Policies → Administrative Templates → System → Logon** → "Always wait for the network at computer startup and logon" = **Enabled**
+6. Nos PCs alvo: `gpupdate /force` + reboot
+
+O `PARAGPOAA.BAT` é idempotente — só reinstala se o script no share for mais novo ou se o serviço estiver parado/inexistente.
+
+### Instalação Manual (sem GPO)
+
+Em um CMD Admin da estação:
+
+```cmd
+"\\srv-105\Sistema de monitoramento\gpo\aaa\service\INSTALAR.BAT"
+```
+
+Auto-eleva via UAC, compila o wrapper C# (.NET Framework 4.x), registra o serviço e inicia.
+
+### Verificação
+
+```powershell
+Get-Service WinSysMon
+Get-Content $env:ProgramData\Microsoft\WinSysMon\sysmon.log -Tail 20
+Get-Content $env:ProgramData\Microsoft\WinSysMon\install.log -Tail 20
+```
+
+Procure no `sysmon.log` por:
+
+- `WMI process watcher ativo` — detecção instantânea OK
+- `Remote blocked apps: N patterns` — leitura do share OK
+- `Heartbeat: iter=X wmi=True patterns=N` — vivo
+- `BLOQUEADO(WMI): nomedoapp PID=...` — bloqueios executados
+
+### Desinstalação
+
+```cmd
+powershell -ExecutionPolicy Bypass -File "\\srv-105\Sistema de monitoramento\gpo\aaa\service\install-service.ps1" -Uninstall
+```
+
+
+
 ### Atalhos de Teclado
 
 | Atalho   | Acao               |
@@ -64,35 +179,60 @@ Catalogo local de aplicativos (nome, executavel, categoria e descricao) armazena
 
 ## Requisitos
 
+### GPO Manager (admin)
 - Windows 10 ou superior
 - PowerShell 5.1
 - Maquina ingressada no dominio Active Directory
 - Permissoes de administrador no dominio (ou delegacao apropriada)
 - Acesso de rede ao SYSVOL do controlador de dominio
 
+### WinSysMon (estações)
+- Windows 10/11 ou Server 2016+
+- .NET Framework 4.x (nativo do Windows)
+- Acesso de rede (SMB) ao share de deploy
+- Privilégios de administrador apenas para instalação
+
 ## Instalacao
 
-1. Clone o repositorio:
+### Admin / UI
 
 ```
 git clone https://github.com/Gabriell12321/GPo.git
 ```
 
-2. Execute o arquivo `GPO Manager.bat` ou rode diretamente pelo PowerShell:
+Executar:
 
-```powershell
-powershell -ExecutionPolicy Bypass -File "gpo.ps1"
+```
+GPO Manager.bat       (GPO Manager em WinForms)
+run.bat               (UI Haxe "Bloquear Apps" para WinSysMon)
 ```
 
-O script solicita elevacao automatica caso nao esteja rodando como administrador.
+### Estações (via GPO ou manual)
+
+Copiar `PARAGPOAA.BAT` + pasta `service\` para o share e apontar Computer Startup Script da GPO (ver seção *Deployment por GPO* acima), ou rodar `INSTALAR.BAT` localmente.
 
 ## Estrutura do Projeto
 
 ```
-gpo.ps1              Script principal da aplicacao
-GPO Manager.bat      Atalho para execucao rapida
-apps_db.json         Catalogo local de aplicativos (gerado em runtime)
-gpo_settings.json    Configuracoes persistentes do usuario (gerado em runtime)
+gpo.ps1                  GPO Manager (WinForms)
+GPO Manager.bat          Atalho de execucao
+apps_db.json             Catalogo de aplicativos (runtime)
+gpo_settings.json        Config persistente (runtime)
+
+src/Main.hx              UI Haxe/Heaps "Bloquear Apps"
+build.hxml               Build do projeto Haxe
+run.bat                  Executar UI Haxe
+bin/gpo.hl               Binario HashLink compilado
+
+scripts/bridge.ps1       Bridge PowerShell da UI Haxe (AD + share)
+
+service/winsysmon.ps1    Agente WinSysMon (serviço Windows)
+service/install-service.ps1  Instalador do serviço (compila wrapper C#)
+service/blocked-apps.json    Lista de apps bloqueados (Global + por PC)
+service/sysmon-config.json   Config do agente
+
+PARAGPOAA.BAT            Startup script da GPO
+INSTALAR.BAT             Instalador manual com auto-elevacao
 ```
 
 ## Interface

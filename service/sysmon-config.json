@@ -1,0 +1,9 @@
+{
+    "BlockedApps": [],
+    "PollInterval": 1,
+    "MonitorLogins": true,
+    "MonitorApps": true,
+    "CollectHardware": true,
+    "HardwareInterval": 3600,
+    "RemoteBlockedAppsPath": "\\\\srv-105\\Sistema de monitoramento\\gpo\\aaa\\service\\blocked-apps.json"
+}
