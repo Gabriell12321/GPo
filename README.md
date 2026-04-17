@@ -22,17 +22,24 @@ O GPO Manager oferece uma interface completa para administradores de rede criare
 - Duplicacao de GPOs com copia completa da pasta SYSVOL
 - Exportacao e importacao de GPOs em formato JSON
 
-### Editor de GPO (5 abas)
+### Editor de GPO (6 abas)
 
-**Geral** — Nome, descricao, status e propriedades detalhadas da GPO.
+**Geral** — Nome, descricao, status e propriedades detalhadas da GPO (GUID, DN, caminho SYSVOL, versoes, datas, CSEs).
 
-**Aplicar a (AD)** — TreeView com checkboxes para vincular e desvincular OUs, usuarios, computadores e grupos do Active Directory.
+**Aplicar a (AD)** — TreeView com checkboxes para vincular e desvincular OUs, com resumo das OUs vinculadas no topo.
 
-**Politicas Comuns** — Politicas pre-configuradas organizadas por categoria, ativaveis por checkbox.
+**Politicas Comuns** — Politicas pre-configuradas organizadas por categoria, ativaveis por checkbox. Detecta automaticamente politicas ja aplicadas via Registry.pol nativo do GPMC.
 
 **Bloqueio de Apps** — Lista de aplicativos para bloqueio com integracao ao cadastro de apps e campo para adicao personalizada.
 
-**Registro Avancado** — Criacao de regras customizadas de registro (hive, caminho, valor, tipo e dado).
+**Scripts / Instalacao** — Gerenciamento de scripts de inicializacao e instalacao de software, com deteccao automatica de scripts nativos (scripts.ini) e pacotes MSI do SYSVOL. Secao de registro avancado para regras customizadas.
+
+**Preferencias (GPP)** — Leitura completa de todas as configuracoes nativas do SYSVOL:
+- GP Preferences (atalhos, drives mapeados, impressoras, arquivos, pastas, registro, servicos, grupos, energia)
+- Redirecionamento de pastas (fdeploy.ini)
+- Politicas de seguranca (GptTmpl.inf): senhas, Kerberos, direitos de usuario, membros de grupo, permissoes de registro e arquivo
+- Software implantado via MSI (.aas)
+- Registry.pol (parser binario PReg)
 
 ### Assistente de GPO Rapida
 
@@ -68,7 +75,7 @@ Catalogo local de aplicativos (nome, executavel, categoria e descricao) armazena
 1. Clone o repositorio:
 
 ```
-git clone https://github.com/seu-usuario/gpo.git
+git clone https://github.com/Gabriell12321/GPo.git
 ```
 
 2. Execute o arquivo `GPO Manager.bat` ou rode diretamente pelo PowerShell:

@@ -16,6 +16,7 @@ gpo_settings.json
 gpo_config.json
 blocked_apps.txt
 registry_rules.json
+install_scripts.json
 
 # Windows
 Thumbs.db

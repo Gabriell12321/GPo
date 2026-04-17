@@ -1481,6 +1481,16 @@ function New-QuickGPO {
     }
 
     Build-WizTree
+
+    function Get-CheckedWizOUs { param($nodes)
+        $result = @()
+        foreach ($n in $nodes) {
+            if ($n.Checked -and $n.Tag) { $result += $n.Tag }
+            if ($n.Nodes.Count -gt 0) { $result += Get-CheckedWizOUs $n.Nodes }
+        }
+        return $result
+    }
+
     $step3.Controls.Add($wizTree)
     $panels += $step3
 
@@ -1570,14 +1580,6 @@ function New-QuickGPO {
             if (-not $anyPol) { $resumo += "  (nenhuma - voce pode adicionar depois)`n" }
             $resumo += "`nDESTINO (OUs):`n"
             $anyOU = $false
-            function Get-CheckedWizOUs { param($nodes)
-                $result = @()
-                foreach ($n in $nodes) {
-                    if ($n.Checked -and $n.Tag) { $result += $n.Tag }
-                    if ($n.Nodes.Count -gt 0) { $result += Get-CheckedWizOUs $n.Nodes }
-                }
-                return $result
-            }
             $checkedOUs = Get-CheckedWizOUs $wizTree.Nodes
             foreach ($ou in $checkedOUs) {
                 $resumo += "  [x] $ou`n"
@@ -1635,9 +1637,33 @@ function New-QuickGPO {
                 }
 
                 # 4) Salvar politicas marcadas no SYSVOL
+                # Mapeamento do wizard para IDs do editor
+                $wizToEditor = @{
+                    "wizBlkUSB"      = "DisableUSB"
+                    "wizBlkCmd"      = "DisableCMD"
+                    "wizBlkRegedit"  = "DisableRegistry"
+                    "wizBlkPanel"    = "DisableControlPanel"
+                    "wizBlkTaskMgr"  = "DisableTaskMgr"
+                    "wizPwdPolicy"   = "MinPwdAge"
+                    "wizNoTheme"     = "NoThemes"
+                    "wizWallpaper"   = "NoWallpaper"
+                    "wizNoUpdate"    = "DisableWindowsUpdate"
+                    "wizNoStore"     = "DisableStore"
+                    "wizNoCortana"   = "DisableCortana"
+                    "wizNoOneDrive"  = "DisableOneDrive"
+                    "wizNoAutoPlay"  = "NoAutoPlay"
+                    "wizNoTelemetry" = "DisableTelemetry"
+                    "wizMapDrive"    = "MapNetworkDrive"
+                    "wizFirewall"    = "EnableFirewall"
+                    "wizNeverSleep"  = "NoSleep"
+                    "wizNoDesktop"   = "NoDispCPL"
+                }
                 $polConfig = @{}
                 foreach ($key in $script:wizChecks.Keys) {
-                    if ($script:wizChecks[$key].Checked) { $polConfig[$key] = $true }
+                    if ($script:wizChecks[$key].Checked) {
+                        $editorId = if ($wizToEditor.ContainsKey($key)) { $wizToEditor[$key] } else { $key }
+                        $polConfig[$editorId] = $true
+                    }
                 }
                 if ($polConfig.Count -gt 0) {
                     $polConfig | ConvertTo-Json | Set-Content "$gpcPath\Machine\gpo_config.json" -Force
@@ -2042,11 +2068,412 @@ function Edit-GPO {
     }
 
     # ── Ler config salva no SYSVOL ──
-    $savedConfig = @{}
+    $script:savedPolicies = @{}
     $configFile = "$sysvolPath\Machine\gpo_config.json"
     if ($sysvolPath -and (Test-Path $configFile)) {
-        try { $savedConfig = Get-Content $configFile -Raw | ConvertFrom-Json -ErrorAction Stop } catch { $savedConfig = @{} }
+        try {
+            $jsonObj = Get-Content $configFile -Raw | ConvertFrom-Json -ErrorAction Stop
+            if ($jsonObj.PSObject) {
+                foreach ($p in $jsonObj.PSObject.Properties) {
+                    $script:savedPolicies[$p.Name] = $p.Value
+                }
+            }
+        } catch {}
     }
+
+    # ── Ler Registry.pol nativo (configuracoes GPMC) ──
+    $script:nativeRegEntries = @()
+    function Parse-RegistryPol {
+        param([string]$PolPath, [string]$Hive)
+        $entries = @()
+        try {
+            $bytes = [System.IO.File]::ReadAllBytes($PolPath)
+            if ($bytes.Length -lt 8) { return $entries }
+            $sig = [System.Text.Encoding]::ASCII.GetString($bytes, 0, 4)
+            if ($sig -ne "PReg") { return $entries }
+            $pos = 8
+            while ($pos -lt ($bytes.Length - 10)) {
+                if ($bytes[$pos] -ne 0x5B -or $bytes[$pos+1] -ne 0x00) { $pos++; continue }
+                $pos += 2
+                $start = $pos
+                while ($pos -lt ($bytes.Length - 1) -and -not ($bytes[$pos] -eq 0x3B -and $bytes[$pos+1] -eq 0x00)) { $pos += 2 }
+                $key = [System.Text.Encoding]::Unicode.GetString($bytes, $start, $pos - $start).TrimEnd([char]0)
+                $pos += 2
+                $start = $pos
+                while ($pos -lt ($bytes.Length - 1) -and -not ($bytes[$pos] -eq 0x3B -and $bytes[$pos+1] -eq 0x00)) { $pos += 2 }
+                $valName = [System.Text.Encoding]::Unicode.GetString($bytes, $start, $pos - $start).TrimEnd([char]0)
+                $pos += 2
+                if (($pos + 4) -gt $bytes.Length) { break }
+                $type = [BitConverter]::ToUInt32($bytes, $pos); $pos += 4
+                $pos += 2
+                if (($pos + 4) -gt $bytes.Length) { break }
+                $size = [BitConverter]::ToUInt32($bytes, $pos); $pos += 4
+                $pos += 2
+                if ($size -gt 0 -and ($pos + $size) -le $bytes.Length) {
+                    $dataBytes = $bytes[$pos..($pos+$size-1)]
+                } else { $dataBytes = @() }
+                $pos += $size
+                $pos += 2
+                $typeName = switch ($type) { 1 {"String"} 2 {"ExpandString"} 4 {"DWord"} 7 {"MultiString"} 11 {"QWord"} 3 {"Binary"} default {"Tipo$type"} }
+                $dataStr = switch ($type) {
+                    4 { if($dataBytes.Count -ge 4){[string][BitConverter]::ToUInt32($dataBytes, 0)}else{"?"} }
+                    11 { if($dataBytes.Count -ge 8){[string][BitConverter]::ToUInt64($dataBytes, 0)}else{"?"} }
+                    3 { "(" + $dataBytes.Count + " bytes)" }
+                    default { [System.Text.Encoding]::Unicode.GetString($dataBytes).TrimEnd([char]0) }
+                }
+                if ($key -and $valName -and $type -ne 0) {
+                    $entries += @{ Hive=$Hive; Key=$key; ValueName=$valName; ValueData=$dataStr; Type=$typeName; Source="Registry.pol" }
+                }
+            }
+        } catch {}
+        return $entries
+    }
+
+    # Machine\Registry.pol
+    foreach ($machSub in @("Machine","MACHINE")) {
+        $polFile = "$sysvolPath\$machSub\Registry.pol"
+        if (Test-Path $polFile) {
+            $script:nativeRegEntries += Parse-RegistryPol $polFile "HKLM"
+            break
+        }
+    }
+    # User\Registry.pol
+    foreach ($userSub in @("User","USER")) {
+        $polFile = "$sysvolPath\$userSub\Registry.pol"
+        if (Test-Path $polFile) {
+            $script:nativeRegEntries += Parse-RegistryPol $polFile "HKCU"
+            break
+        }
+    }
+
+    # ── Ler scripts.ini nativo ──
+    $script:nativeScripts = @()
+    foreach ($sub in @("Machine","MACHINE")) {
+        $iniPath = "$sysvolPath\$sub\Scripts\scripts.ini"
+        if (Test-Path $iniPath) {
+            try {
+                $iniContent = Get-Content $iniPath -Encoding Unicode -ErrorAction SilentlyContinue
+                $section = ""
+                $idx = 0
+                foreach ($line in $iniContent) {
+                    if ($line -match '^\[(.+)\]') { $section = $Matches[1]; $idx = 0; continue }
+                    if ($line -match "^${idx}CmdLine=(.+)") {
+                        $cmd = $Matches[1].Trim()
+                        $parLine = $iniContent | Where-Object { $_ -match "^${idx}Parameters=" } | Select-Object -First 1
+                        $par = if ($parLine -match "=(.*)") { $Matches[1].Trim() } else { "" }
+                        $script:nativeScripts += @{ Type=$section; Command=$cmd; Parameters=$par }
+                        $idx++
+                    }
+                }
+            } catch {}
+            break
+        }
+    }
+
+    # ── Ler GPT.INI ──
+    $script:gptVersion = ""
+    $gptIni = "$sysvolPath\GPT.INI"
+    if (Test-Path $gptIni) {
+        try {
+            $content = Get-Content $gptIni -ErrorAction SilentlyContinue
+            $vLine = $content | Where-Object { $_ -match "^Version=" } | Select-Object -First 1
+            if ($vLine -match "=(\d+)") { $script:gptVersion = $Matches[1] }
+        } catch {}
+    }
+
+    # ── Ler Preferences XML (GP Preferences nativas) ──
+    $script:nativePreferences = @()
+    $actionMap = @{ "C"="Criar"; "U"="Atualizar"; "R"="Substituir"; "D"="Deletar" }
+    foreach ($scope in @("Machine","User","MACHINE","USER")) {
+        $prefRoot = "$sysvolPath\$scope\Preferences"
+        if (-not (Test-Path $prefRoot)) { continue }
+        $scopeLabel = if ($scope -match "^[Mm]") { "Computador" } else { "Usuario" }
+        Get-ChildItem $prefRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+            $prefType = $_.Name
+            Get-ChildItem $_.FullName -Filter "*.xml" -ErrorAction SilentlyContinue | ForEach-Object {
+                try {
+                    $xml = [xml](Get-Content $_.FullName -Raw -ErrorAction SilentlyContinue)
+                    if (-not $xml) { return }
+                    $root = $xml.DocumentElement
+                    foreach ($node in $root.ChildNodes) {
+                        if ($node.NodeType -ne "Element") { continue }
+                        $act = if ($node.Properties) { $node.Properties.action } else { "" }
+                        $actLabel = if ($actionMap[$act]) { $actionMap[$act] } else { $act }
+                        switch ($prefType) {
+                            "Shortcuts" {
+                                $p = $node.Properties
+                                $script:nativePreferences += @{
+                                    Tipo="Atalho"; Escopo=$scopeLabel; Acao=$actLabel
+                                    Nome=$node.name; Caminho=$p.targetPath
+                                    Detalhes="Em: $($p.shortcutPath)  Icone: $($p.iconPath)  Args: $($p.arguments)"
+                                }
+                            }
+                            "Drives" {
+                                $p = $node.Properties
+                                $script:nativePreferences += @{
+                                    Tipo="Drive Mapeado"; Escopo=$scopeLabel; Acao=$actLabel
+                                    Nome="$($p.letter): $($node.name)"; Caminho=$p.path
+                                    Detalhes="Label: $($p.label)  Persistente: $($p.persistent)"
+                                }
+                            }
+                            "Printers" {
+                                $p = $node.Properties
+                                $pName = if ($p.localName) { $p.localName } else { $node.name }
+                                $pPath = if ($p.path) { $p.path } else { $p.ipAddress }
+                                $script:nativePreferences += @{
+                                    Tipo="Impressora"; Escopo=$scopeLabel; Acao=$actLabel
+                                    Nome=$pName; Caminho=$pPath
+                                    Detalhes="Padrao: $($p.default)  IP: $($p.ipAddress)"
+                                }
+                            }
+                            "Files" {
+                                $p = $node.Properties
+                                $script:nativePreferences += @{
+                                    Tipo="Arquivo"; Escopo=$scopeLabel; Acao=$actLabel
+                                    Nome=$node.name; Caminho="$($p.fromPath) -> $($p.targetPath)"
+                                    Detalhes="Oculto: $($p.hidden)  SomenteLeitura: $($p.readOnly)"
+                                }
+                            }
+                            "Folders" {
+                                $p = $node.Properties
+                                $script:nativePreferences += @{
+                                    Tipo="Pasta"; Escopo=$scopeLabel; Acao=$actLabel
+                                    Nome=$node.name; Caminho=$p.path
+                                    Detalhes="Oculto: $($p.hidden)  SomenteLeitura: $($p.readOnly)"
+                                }
+                            }
+                            "Registry" {
+                                $p = $node.Properties
+                                $script:nativePreferences += @{
+                                    Tipo="Registro (Pref)"; Escopo=$scopeLabel; Acao=$actLabel
+                                    Nome="$($p.hive)\$($p.key)\$($p.name)"; Caminho="$($p.type) = $($p.value)"
+                                    Detalhes="Hive: $($p.hive)"
+                                }
+                            }
+                            "Services" {
+                                $p = $node.Properties
+                                $script:nativePreferences += @{
+                                    Tipo="Servico"; Escopo=$scopeLabel; Acao=$actLabel
+                                    Nome=$p.serviceName; Caminho="Inicio: $($p.startupType)"
+                                    Detalhes="Acao: $($p.serviceAction)  Nome: $($node.name)"
+                                }
+                            }
+                            "Groups" {
+                                $p = $node.Properties
+                                $gName = if ($p.groupName) { $p.groupName } else { $node.name }
+                                $script:nativePreferences += @{
+                                    Tipo="Grupo/Usuario"; Escopo=$scopeLabel; Acao=$actLabel
+                                    Nome=$gName; Caminho=""
+                                    Detalhes="Nome: $($node.name)"
+                                }
+                            }
+                            "PowerOptions" {
+                                $script:nativePreferences += @{
+                                    Tipo="Energia"; Escopo=$scopeLabel; Acao=$actLabel
+                                    Nome=$node.name; Caminho=""
+                                    Detalhes=""
+                                }
+                            }
+                            default {
+                                $script:nativePreferences += @{
+                                    Tipo=$prefType; Escopo=$scopeLabel; Acao=$actLabel
+                                    Nome=$node.name; Caminho=""
+                                    Detalhes=""
+                                }
+                            }
+                        }
+                    }
+                } catch {}
+            }
+        }
+    }
+
+    # ── Ler fdeploy.ini (Redirecionamento de Pastas) ──
+    $script:nativeFolderRedirect = @()
+    $folderStatusMap = @{ "0"="Basico (redirecionar para local)"; "10"="Basico (redirecionar de volta)"; "4"="Avancado" }
+    foreach ($scope in @("User","USER")) {
+        $fdeployPath = "$sysvolPath\$scope\Documents & Settings\fdeploy.ini"
+        if (Test-Path $fdeployPath) {
+            try {
+                $fContent = Get-Content $fdeployPath -Encoding Unicode -ErrorAction SilentlyContinue
+                $section = ""; $statusMap = @{}
+                foreach ($line in $fContent) {
+                    $tl = $line.Trim()
+                    if ($tl -match '^\[(.+)\]$') { $section = $Matches[1]; continue }
+                    if (-not $tl -or $tl.StartsWith(";")) { continue }
+                    if ($section -eq "FolderStatus" -and $tl -match '^(.+?)=(\d+)') {
+                        $statusMap[$Matches[1]] = $Matches[2]
+                    }
+                    elseif ($section -ne "FolderStatus" -and $tl -match '^(.+?)=(.+)$') {
+                        $sid = $Matches[1]; $target = $Matches[2]
+                        $sidLabel = switch -Wildcard ($sid) { "s-1-1-0" {"Todos"}; "S-1-1-0" {"Todos"}; default {$sid} }
+                        $stVal = if ($statusMap[$section]) { $statusMap[$section] } else { "?" }
+                        $stLabel = if ($folderStatusMap[$stVal]) { $folderStatusMap[$stVal] } else { "Status=$stVal" }
+                        $script:nativeFolderRedirect += @{
+                            Pasta=$section; Destino=$target; Aplica=$sidLabel; Status=$stLabel
+                        }
+                        $script:nativePreferences += @{
+                            Tipo="Redir. Pasta"; Escopo="Usuario"; Acao=$stLabel
+                            Nome=$section; Caminho=$target; Detalhes="Aplica: $sidLabel"
+                        }
+                    }
+                }
+            } catch {}
+            break
+        }
+    }
+
+    # ── Ler GptTmpl.inf (Politicas de Seguranca) ──
+    $script:nativeSecuritySettings = @()
+    foreach ($sub in @("Machine","MACHINE")) {
+        $tmplPath = "$sysvolPath\$sub\Microsoft\Windows NT\SecEdit\GptTmpl.inf"
+        if (Test-Path $tmplPath) {
+            try {
+                $tmplContent = Get-Content $tmplPath -ErrorAction SilentlyContinue
+                $section = ""
+                foreach ($line in $tmplContent) {
+                    $tl = $line.Trim()
+                    if ($tl -match '^\[(.+)\]$') { $section = $Matches[1]; continue }
+                    if (-not $tl -or $tl.StartsWith(";") -or $section -eq "Unicode" -or $section -eq "Version") { continue }
+                    switch ($section) {
+                        "System Access" {
+                            if ($tl -match '^(.+?)\s*=\s*(.+)$') {
+                                $settingNames = @{
+                                    "MinimumPasswordAge"="Idade minima da senha (dias)"
+                                    "MaximumPasswordAge"="Idade maxima da senha (dias)"
+                                    "MinimumPasswordLength"="Comprimento minimo da senha"
+                                    "PasswordHistorySize"="Historico de senhas"
+                                    "LockoutBadCount"="Tentativas antes do bloqueio"
+                                    "RequireLogonToChangePassword"="Exigir logon para alterar senha"
+                                    "ForceLogoffWhenHourExpire"="Forcar logoff ao expirar horario"
+                                    "ClearTextPassword"="Armazenar senhas em texto limpo"
+                                    "LSAAnonymousNameLookup"="Permitir consulta anonima LSA"
+                                    "PasswordComplexity"="Exigir complexidade de senha"
+                                    "LockoutDuration"="Duracao do bloqueio (min)"
+                                    "ResetLockoutCount"="Resetar contador apos (min)"
+                                }
+                                $name = if ($settingNames[$Matches[1]]) { $settingNames[$Matches[1]] } else { $Matches[1] }
+                                $entry = @{ Secao="Acesso ao Sistema"; Nome=$name; Valor=$Matches[2] }
+                                $script:nativeSecuritySettings += $entry
+                                $script:nativePreferences += @{
+                                    Tipo="Seguranca"; Escopo="Computador"; Acao="Configurado"
+                                    Nome=$name; Caminho=$Matches[2]; Detalhes="[System Access] $($Matches[1])"
+                                }
+                            }
+                        }
+                        "Kerberos Policy" {
+                            if ($tl -match '^(.+?)\s*=\s*(.+)$') {
+                                $kNames = @{
+                                    "MaxTicketAge"="Validade maxima do ticket (hrs)"
+                                    "MaxRenewAge"="Renovacao maxima do ticket (dias)"
+                                    "MaxServiceAge"="Validade maxima do ticket de servico (min)"
+                                    "MaxClockSkew"="Tolerancia de relogio (min)"
+                                    "TicketValidateClient"="Validar cliente"
+                                }
+                                $name = if ($kNames[$Matches[1]]) { $kNames[$Matches[1]] } else { $Matches[1] }
+                                $script:nativeSecuritySettings += @{ Secao="Kerberos"; Nome=$name; Valor=$Matches[2] }
+                                $script:nativePreferences += @{
+                                    Tipo="Seguranca"; Escopo="Computador"; Acao="Configurado"
+                                    Nome=$name; Caminho=$Matches[2]; Detalhes="[Kerberos Policy]"
+                                }
+                            }
+                        }
+                        "Privilege Rights" {
+                            if ($tl -match '^(.+?)\s*=\s*(.+)$') {
+                                $privNames = @{
+                                    "SeAssignPrimaryTokenPrivilege"="Substituir token de processo"
+                                    "SeAuditPrivilege"="Gerar auditorias de seguranca"
+                                    "SeBackupPrivilege"="Fazer backup de arquivos"
+                                    "SeBatchLogonRight"="Logon como tarefa em lotes"
+                                    "SeChangeNotifyPrivilege"="Ignorar verificacao transversal"
+                                    "SeDebugPrivilege"="Depurar programas"
+                                    "SeInteractiveLogonRight"="Logon local"
+                                    "SeLoadDriverPrivilege"="Carregar drivers de dispositivo"
+                                    "SeMachineAccountPrivilege"="Adicionar estacoes ao dominio"
+                                    "SeNetworkLogonRight"="Acessar pela rede"
+                                    "SeRemoteShutdownPrivilege"="Forcar desligamento remoto"
+                                    "SeRestorePrivilege"="Restaurar arquivos"
+                                    "SeSecurityPrivilege"="Gerenciar log de auditoria"
+                                    "SeShutdownPrivilege"="Desligar o sistema"
+                                    "SeSystemEnvironmentPrivilege"="Modificar valores de firmware"
+                                    "SeSystemTimePrivilege"="Alterar hora do sistema"
+                                    "SeTakeOwnershipPrivilege"="Apropriar-se de objetos"
+                                    "SeUndockPrivilege"="Remover estacao de ancoragem"
+                                    "SeEnableDelegationPrivilege"="Habilitar delegacao"
+                                    "SeCreatePagefilePrivilege"="Criar arquivo de paginacao"
+                                    "SeIncreaseBasePriorityPrivilege"="Aumentar prioridade"
+                                    "SeIncreaseQuotaPrivilege"="Ajustar cotas de memoria"
+                                    "SeProfileSingleProcessPrivilege"="Tracar perfil de processo"
+                                    "SeSystemProfilePrivilege"="Tracar perfil do sistema"
+                                }
+                                $name = if ($privNames[$Matches[1]]) { $privNames[$Matches[1]] } else { $Matches[1] }
+                                $sids = ($Matches[2] -split ',') | ForEach-Object { $_.Trim().TrimStart('*') }
+                                $count = $sids.Count
+                                $script:nativeSecuritySettings += @{ Secao="Direitos"; Nome=$name; Valor="$count SID(s)" }
+                                $script:nativePreferences += @{
+                                    Tipo="Privilegio"; Escopo="Computador"; Acao="$count SID(s)"
+                                    Nome=$name; Caminho=($sids | Select -First 3) -join ", "
+                                    Detalhes=if($count -gt 3){"+ $($count-3) mais..."}else{""}
+                                }
+                            }
+                        }
+                        "Group Membership" {
+                            if ($tl -match '^(.+?)__(.+?)\s*=\s*(.*)$') {
+                                $grp = $Matches[1].TrimStart('*'); $rel = $Matches[2]; $members = $Matches[3]
+                                $script:nativeSecuritySettings += @{ Secao="Membros de Grupo"; Nome="$grp ($rel)"; Valor=$members }
+                                $script:nativePreferences += @{
+                                    Tipo="Membro Grupo"; Escopo="Computador"; Acao=$rel
+                                    Nome=$grp; Caminho=$members; Detalhes=""
+                                }
+                            }
+                        }
+                        "Registry Values" {
+                            if ($tl -match '^(.+?)\s*=\s*(\d+),(.+)$') {
+                                $script:nativeSecuritySettings += @{ Secao="Valores de Registro"; Nome=$Matches[1]; Valor="Tipo$($Matches[2])=$($Matches[3])" }
+                                $script:nativePreferences += @{
+                                    Tipo="Reg. Seguranca"; Escopo="Computador"; Acao="Configurado"
+                                    Nome=$Matches[1].Replace("MACHINE\",""); Caminho=$Matches[3]; Detalhes="RegType=$($Matches[2])"
+                                }
+                            }
+                        }
+                        "Registry Keys" {
+                            if ($tl -match '^"(.+?)"') {
+                                $script:nativePreferences += @{
+                                    Tipo="Perm. Registro"; Escopo="Computador"; Acao="ACL"
+                                    Nome=$Matches[1].Replace("MACHINE\",""); Caminho=""; Detalhes="Permissoes de chave"
+                                }
+                            }
+                        }
+                        "File Security" {
+                            if ($tl -match '^"(.+?)"') {
+                                $script:nativePreferences += @{
+                                    Tipo="Perm. Arquivo"; Escopo="Computador"; Acao="ACL"
+                                    Nome=$Matches[1]; Caminho=""; Detalhes="Permissoes de arquivo"
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch {}
+            break
+        }
+    }
+
+    # ── Ler Software Deployment (.aas) ──
+    foreach ($sub in @("Machine","MACHINE")) {
+        $appsDir = "$sysvolPath\$sub\Applications"
+        if (Test-Path $appsDir) {
+            Get-ChildItem $appsDir -Filter "*.aas" -ErrorAction SilentlyContinue | ForEach-Object {
+                $script:nativePreferences += @{
+                    Tipo="Software (MSI)"; Escopo="Computador"; Acao="Implantado"
+                    Nome=$_.BaseName; Caminho=$_.FullName; Detalhes="$($_.Length) bytes"
+                }
+            }
+            break
+        }
+    }
+
+    # ── Mapear Registry.pol sera feito apos $commonPolicies ──
 
     $dlg = New-Object System.Windows.Forms.Form
     $dlg.Text = "Editar GPO: $GpoName"
@@ -2203,6 +2630,44 @@ function Edit-GPO {
     $lblTargetSub.Location = New-Object System.Drawing.Point(15, 32)
     $pnlTargetHdr.Controls.Add($lblTargetSub)
     $pnlTarget.Controls.Add($pnlTargetHdr)
+
+    # Painel de resumo dos vinculos ativos
+    $pnlLinkedSummary = New-Object System.Windows.Forms.Panel
+    $pnlLinkedSummary.Dock = "Top"; $pnlLinkedSummary.Height = 50; $pnlLinkedSummary.BackColor = [System.Drawing.Color]::FromArgb(25, 25, 40)
+    $pnlLinkedSummary.Padding = New-Object System.Windows.Forms.Padding(15, 4, 15, 4)
+
+    $lblLinkedIcon = New-Object System.Windows.Forms.Label
+    $lblLinkedIcon.Text = "VINCULADA EM:"; $lblLinkedIcon.AutoSize = $true
+    $lblLinkedIcon.ForeColor = $Green; $lblLinkedIcon.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+    $lblLinkedIcon.Location = New-Object System.Drawing.Point(15, 5)
+    $pnlLinkedSummary.Controls.Add($lblLinkedIcon)
+
+    $lblLinkedList = New-Object System.Windows.Forms.Label
+    $lblLinkedList.Text = "(carregando...)"; $lblLinkedList.AutoSize = $false
+    $lblLinkedList.Size = New-Object System.Drawing.Size(1200, 36)
+    $lblLinkedList.ForeColor = $Green; $lblLinkedList.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $lblLinkedList.Location = New-Object System.Drawing.Point(130, 5)
+    $pnlLinkedSummary.Controls.Add($lblLinkedList)
+
+    $pnlTarget.Controls.Add($pnlLinkedSummary)
+
+    function Update-LinkedSummary {
+        if ($script:linkedOUs.Count -eq 0) {
+            $lblLinkedList.Text = "(nenhum vinculo ativo)"
+            $lblLinkedList.ForeColor = $Overlay
+            $lblLinkedIcon.ForeColor = $Overlay
+        } else {
+            $names = @()
+            foreach ($dn in $script:linkedOUs) {
+                $parts = $dn -split ","
+                $ouName = ($parts[0] -split "=")[1]
+                $names += $ouName
+            }
+            $lblLinkedList.Text = $names -join "   |   "
+            $lblLinkedList.ForeColor = $Green
+            $lblLinkedIcon.ForeColor = $Green
+        }
+    }
 
     # Toolbar: filtro + legenda + botao aplicar
     $pnlADTool = New-Object System.Windows.Forms.Panel
@@ -2479,10 +2944,12 @@ function Edit-GPO {
         }
 
         $treeAD.EndUpdate()
+        if ($treeAD.Nodes.Count -gt 0) { $treeAD.Nodes[0].EnsureVisible() }
         $dlg.Cursor = [System.Windows.Forms.Cursors]::Default
     }
 
     Build-ADTree
+    Update-LinkedSummary
 
     # Botoes
     $btnExpandAll.Add_Click({ $treeAD.ExpandAll() })
@@ -2683,11 +3150,19 @@ function Edit-GPO {
 
         # Rebuild tree
         Build-ADTree
+        Update-LinkedSummary
     })
 
     $splitAD.Panel1.Controls.Add($treeAD)
     $splitAD.Panel2.Controls.Add($pnlDetail)
     $pnlTarget.Controls.Add($splitAD)
+
+    # Corrigir ordem visual: WinForms Dock=Top empilha em ordem inversa
+    # Ordem desejada (de cima pra baixo): Header -> LinkedSummary -> Toolbar -> SplitAD(Fill)
+    $pnlTargetHdr.BringToFront()
+    $pnlLinkedSummary.BringToFront()
+    $pnlADTool.BringToFront()
+    $splitAD.BringToFront()
 
     $tabTarget.Controls.Add($pnlTarget)
     $tabs.TabPages.Add($tabTarget)
@@ -2698,6 +3173,27 @@ function Edit-GPO {
     $tabPolicies = New-Object System.Windows.Forms.TabPage
     $tabPolicies.Text = "  Politicas Comuns  "
     $tabPolicies.BackColor = $BgDark
+
+    # Resumo de politicas ativas no topo
+    $pnlPolSummary = New-Object System.Windows.Forms.Panel
+    $pnlPolSummary.Dock = "Top"; $pnlPolSummary.Height = 36; $pnlPolSummary.BackColor = [System.Drawing.Color]::FromArgb(25, 25, 40)
+    $activeCount = $script:savedPolicies.Count
+    $lblPolSummary = New-Object System.Windows.Forms.Label
+    $lblPolSummary.AutoSize = $true; $lblPolSummary.Location = New-Object System.Drawing.Point(15, 9)
+    $lblPolSummary.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+    if ($activeCount -gt 0) {
+        $activeNames = @()
+        foreach ($pol in $commonPolicies) {
+            if ($script:savedPolicies.ContainsKey($pol.Id)) { $activeNames += $pol.Name }
+        }
+        $lblPolSummary.Text = "ATIVAS ($activeCount):  $($activeNames -join '  |  ')"
+        $lblPolSummary.ForeColor = $Green
+    } else {
+        $lblPolSummary.Text = "NENHUMA POLITICA ATIVA"
+        $lblPolSummary.ForeColor = $Overlay
+    }
+    $pnlPolSummary.Controls.Add($lblPolSummary)
+    $tabPolicies.Controls.Add($pnlPolSummary)
 
     $pnlPol = New-Object System.Windows.Forms.Panel
     $pnlPol.Dock = "Fill"; $pnlPol.AutoScroll = $true; $pnlPol.Padding = New-Object System.Windows.Forms.Padding(20)
@@ -2753,6 +3249,32 @@ function Edit-GPO {
         @{ Id="AuditObjectAccess";    Cat="Auditoria"; Name="Auditar acesso a objetos"; Desc="Registra acesso a arquivos e pastas"; Hive="HKLM"; Key="SOFTWARE\Policies\Microsoft\Windows\System"; Val="AuditObjectAccess"; Data="3" }
     )
 
+    # ── Mapear Registry.pol nativo para politicas conhecidas ──
+    foreach ($regEntry in $script:nativeRegEntries) {
+        foreach ($pol in $commonPolicies) {
+            if ($regEntry.Key -like "*$($pol.Key)*" -and $regEntry.ValueName -eq $pol.Val) {
+                if (-not $script:savedPolicies.ContainsKey($pol.Id)) {
+                    $script:savedPolicies[$pol.Id] = $true
+                }
+                break
+            }
+        }
+    }
+
+    # Atualizar resumo apos mapeamento
+    $activeCount = $script:savedPolicies.Count
+    if ($activeCount -gt 0) {
+        $activeNames = @()
+        foreach ($pol in $commonPolicies) {
+            if ($script:savedPolicies.ContainsKey($pol.Id)) { $activeNames += $pol.Name }
+        }
+        $lblPolSummary.Text = "ATIVAS ($activeCount):  $($activeNames -join '  |  ')"
+        $lblPolSummary.ForeColor = $Green
+    } else {
+        $lblPolSummary.Text = "NENHUMA POLITICA ATIVA"
+        $lblPolSummary.ForeColor = $Overlay
+    }
+
     $py = 15
     $lastCat = ""
     $chkBoxes = @{}
@@ -2783,8 +3305,9 @@ function Edit-GPO {
         $chk.Location = New-Object System.Drawing.Point(20, $py)
         $chk.Tag = $pol.Id
         # Verificar se estava salvo
-        if ($savedConfig.PSObject -and $savedConfig.PSObject.Properties[$pol.Id]) {
-            $chk.Checked = [bool]$savedConfig.($pol.Id)
+        if ($script:savedPolicies.ContainsKey($pol.Id)) {
+            $chk.Checked = $true
+            $chk.ForeColor = $Green
         }
         $pnlPol.Controls.Add($chk); $py += 6
 
@@ -2969,48 +3492,206 @@ function Edit-GPO {
     $tabs.TabPages.Add($tabApps)
 
     # ════════════════════════════════════════
-    #  TAB 5: REGISTRO AVANCADO
+    #  TAB 5: SCRIPTS E INSTALACAO
     # ════════════════════════════════════════
     $tabReg = New-Object System.Windows.Forms.TabPage
-    $tabReg.Text = "  Registro Avancado  "
+    $tabReg.Text = "  Scripts / Instalacao  "
     $tabReg.BackColor = $BgDark
 
-    $pnlRegInfo = New-Object System.Windows.Forms.Panel
-    $pnlRegInfo.Dock = "Top"; $pnlRegInfo.Height = 50; $pnlRegInfo.BackColor = $BgPanel
-    $lblRegInfo = New-Object System.Windows.Forms.Label
-    $lblRegInfo.Text = "Regras de registro personalizadas (para usuarios avancados):"
-    $lblRegInfo.AutoSize = $true; $lblRegInfo.ForeColor = $Yellow
-    $lblRegInfo.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
-    $lblRegInfo.Location = New-Object System.Drawing.Point(15, 14)
-    $pnlRegInfo.Controls.Add($lblRegInfo)
-    $tabReg.Controls.Add($pnlRegInfo)
+    $pnlTab5 = New-Object System.Windows.Forms.Panel
+    $pnlTab5.Dock = "Fill"; $pnlTab5.AutoScroll = $true; $pnlTab5.Padding = New-Object System.Windows.Forms.Padding(15)
+
+    # ── SECAO 1: INSTALACAO DE SOFTWARE ──
+    $lblInstTitle = New-Object System.Windows.Forms.Label
+    $lblInstTitle.Text = "INSTALACAO DE SOFTWARE"
+    $lblInstTitle.AutoSize = $true; $lblInstTitle.ForeColor = $Yellow
+    $lblInstTitle.Font = New-Object System.Drawing.Font("Segoe UI", 11, [System.Drawing.FontStyle]::Bold)
+    $lblInstTitle.Location = New-Object System.Drawing.Point(15, 10)
+    $pnlTab5.Controls.Add($lblInstTitle)
+
+    $lblInstDesc = New-Object System.Windows.Forms.Label
+    $lblInstDesc.Text = "Adicione links ou caminhos de instaladores. Cole o caminho de rede ou URL do executavel."
+    $lblInstDesc.AutoSize = $true; $lblInstDesc.ForeColor = $Overlay
+    $lblInstDesc.Location = New-Object System.Drawing.Point(15, 36)
+    $pnlTab5.Controls.Add($lblInstDesc)
+
+    $toolInst = New-Object System.Windows.Forms.Panel
+    $toolInst.Location = New-Object System.Drawing.Point(10, 58); $toolInst.Size = New-Object System.Drawing.Size(950, 38)
+
+    $btnAddInst = New-Object System.Windows.Forms.Button
+    $btnAddInst.Text = "+ Adicionar Software"; $btnAddInst.Location = New-Object System.Drawing.Point(5, 4)
+    $btnAddInst.Size = New-Object System.Drawing.Size(180, 30); $btnAddInst.BackColor = $Green; $btnAddInst.ForeColor = $BgDark
+    $btnAddInst.FlatStyle = "Flat"; $btnAddInst.Cursor = [System.Windows.Forms.Cursors]::Hand
+    $btnAddInst.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+    $toolInst.Controls.Add($btnAddInst)
+
+    $btnRemoveInst = New-Object System.Windows.Forms.Button
+    $btnRemoveInst.Text = "Remover"; $btnRemoveInst.Location = New-Object System.Drawing.Point(195, 4)
+    $btnRemoveInst.Size = New-Object System.Drawing.Size(100, 30); $btnRemoveInst.BackColor = $Red; $btnRemoveInst.ForeColor = [System.Drawing.Color]::White
+    $btnRemoveInst.FlatStyle = "Flat"; $btnRemoveInst.Cursor = [System.Windows.Forms.Cursors]::Hand
+    $toolInst.Controls.Add($btnRemoveInst)
+    $pnlTab5.Controls.Add($toolInst)
+
+    $dgvInst = New-Object System.Windows.Forms.DataGridView
+    $dgvInst.Location = New-Object System.Drawing.Point(15, 100); $dgvInst.Size = New-Object System.Drawing.Size(940, 200)
+    $dgvInst.BackgroundColor = $BgDark; $dgvInst.ForeColor = $FgText; $dgvInst.GridColor = $BgField
+    $dgvInst.BorderStyle = "FixedSingle"; $dgvInst.CellBorderStyle = "SingleHorizontal"
+    $dgvInst.ColumnHeadersDefaultCellStyle.BackColor = $BgPanel; $dgvInst.ColumnHeadersDefaultCellStyle.ForeColor = $Accent
+    $dgvInst.DefaultCellStyle.BackColor = $BgDark; $dgvInst.DefaultCellStyle.ForeColor = $FgText
+    $dgvInst.DefaultCellStyle.SelectionBackColor = [System.Drawing.Color]::FromArgb(60,60,90)
+    $dgvInst.AlternatingRowsDefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(36, 36, 54)
+    $dgvInst.RowHeadersVisible = $false; $dgvInst.AllowUserToAddRows = $false
+    $dgvInst.SelectionMode = "FullRowSelect"; $dgvInst.AutoSizeColumnsMode = "Fill"
+    $dgvInst.EnableHeadersVisualStyles = $false; $dgvInst.ReadOnly = $true
+    $dgvInst.Anchor = "Top,Left,Right"
+
+    $dgvInst.Columns.Add("InstName", "Nome") | Out-Null
+    $dgvInst.Columns.Add("InstPath", "Caminho / URL") | Out-Null
+    $dgvInst.Columns.Add("InstArgs", "Argumentos") | Out-Null
+    $dgvInst.Columns["InstName"].FillWeight = 20; $dgvInst.Columns["InstPath"].FillWeight = 55; $dgvInst.Columns["InstArgs"].FillWeight = 25
+
+    $script:installEntries = [System.Collections.ArrayList]@()
+    # Carregar instalacoes salvas (nosso JSON)
+    $instFile = "$sysvolPath\Machine\install_scripts.json"
+    if ($sysvolPath -and (Test-Path $instFile)) {
+        try {
+            $loaded = Get-Content $instFile -Raw | ConvertFrom-Json
+            foreach ($r in $loaded) {
+                $entry = @{ Name=$r.Name; Path=$r.Path; Args=$r.Args }
+                $script:installEntries.Add($entry) | Out-Null
+                $dgvInst.Rows.Add($r.Name, $r.Path, $r.Args) | Out-Null
+            }
+        } catch {}
+    }
+
+    # Carregar scripts nativos detectados (de $script:nativeScripts)
+    foreach ($ns in $script:nativeScripts) {
+        $alreadyListed = $false
+        foreach ($e in $script:installEntries) {
+            if ($e.Path -and $e.Path -like "*$($ns.Command)*") { $alreadyListed = $true; break }
+        }
+        if (-not $alreadyListed -and $ns.Command) {
+            $entry = @{ Name=[System.IO.Path]::GetFileNameWithoutExtension($ns.Command); Path=$ns.Command; Args="($($ns.Type)) $($ns.Parameters)".Trim() }
+            $script:installEntries.Add($entry) | Out-Null
+            $rowIdx = $dgvInst.Rows.Add($entry.Name, $entry.Path, $entry.Args)
+            $dgvInst.Rows[$rowIdx].DefaultCellStyle.ForeColor = $Yellow
+        }
+    }
+
+    # Detectar scripts de startup existentes na pasta SYSVOL (configurados via GPMC)
+    if ($sysvolPath) {
+        $startupDir = "$sysvolPath\Machine\Scripts\Startup"
+        if (Test-Path $startupDir) {
+            $scripts = Get-ChildItem $startupDir -File -ErrorAction SilentlyContinue
+            foreach ($sf in $scripts) {
+                if ($sf.Name -eq "scripts.ini" -or $sf.Name -eq "psscripts.ini") { continue }
+                $alreadyListed = $false
+                foreach ($e in $script:installEntries) {
+                    if ($e.Path -and $e.Path -like "*$($sf.Name)*") { $alreadyListed = $true; break }
+                }
+                if (-not $alreadyListed) {
+                    $entry = @{ Name=$sf.BaseName; Path=$sf.FullName; Args="(startup script SYSVOL)" }
+                    $script:installEntries.Add($entry) | Out-Null
+                    $dgvInst.Rows.Add($entry.Name, $entry.Path, $entry.Args) | Out-Null
+                }
+            }
+        }
+
+        # Ler scripts.ini para pegar scripts registrados com parametros
+        foreach ($iniSub in @("Machine\Scripts\Startup\scripts.ini","Machine\Scripts\scripts.ini","MACHINE\Scripts\Startup\scripts.ini","MACHINE\Scripts\scripts.ini")) {
+            $scriptsIni = "$sysvolPath\$iniSub"
+            if (Test-Path $scriptsIni) {
+                try {
+                    $iniContent = Get-Content $scriptsIni -Encoding Unicode -ErrorAction SilentlyContinue
+                    if (-not $iniContent) { $iniContent = Get-Content $scriptsIni -ErrorAction SilentlyContinue }
+                    $idx = 0
+                    while ($true) {
+                        $cmdLine = $iniContent | Where-Object { $_ -match "^${idx}CmdLine=" }
+                        $parLine = $iniContent | Where-Object { $_ -match "^${idx}Parameters=" }
+                        if (-not $cmdLine) { break }
+                        $cmd = ($cmdLine -split "=", 2)[1].Trim()
+                        $par = if ($parLine) { ($parLine -split "=", 2)[1].Trim() } else { "" }
+                        if ($cmd) {
+                            $alreadyListed = $false
+                            foreach ($e in $script:installEntries) {
+                                if ($e.Path -and ($e.Path -like "*$cmd*" -or $cmd -like "*$($e.Name)*")) { $alreadyListed = $true; break }
+                            }
+                            if (-not $alreadyListed) {
+                                $entry = @{ Name=[System.IO.Path]::GetFileNameWithoutExtension($cmd); Path=$cmd; Args=$par }
+                                $script:installEntries.Add($entry) | Out-Null
+                                $dgvInst.Rows.Add($entry.Name, $entry.Path, $entry.Args) | Out-Null
+                            }
+                        }
+                        $idx++
+                    }
+                } catch {}
+                break
+            }
+        }
+
+        # Detectar pacotes MSI de Software Installation (via AD Class Store)
+        try {
+            $pkgPath = "LDAP://CN=Packages,CN=Class Store,CN=Machine,$($gpoEntry.distinguishedName)"
+            $pkgContainer = [ADSI]$pkgPath
+            if ($pkgContainer -and $pkgContainer.Children) {
+                foreach ($pkg in $pkgContainer.Children) {
+                    $pkgName = [string]$pkg.displayName
+                    $msiPath = [string]$pkg.msiFileList
+                    if (-not $msiPath) { $msiPath = [string]$pkg.msiScriptPath }
+                    if ($pkgName) {
+                        $alreadyListed = $false
+                        foreach ($e in $script:installEntries) {
+                            if ($e.Name -eq $pkgName) { $alreadyListed = $true; break }
+                        }
+                        if (-not $alreadyListed) {
+                            $entry = @{ Name=$pkgName; Path=$(if($msiPath){$msiPath}else{"(MSI via GPO)"}); Args="(Software Installation)" }
+                            $script:installEntries.Add($entry) | Out-Null
+                            $dgvInst.Rows.Add($entry.Name, $entry.Path, $entry.Args) | Out-Null
+                        }
+                    }
+                }
+            }
+        } catch {}
+    }
+
+    $pnlTab5.Controls.Add($dgvInst)
+
+    # ── SECAO 2: REGISTRO AVANCADO ──
+    $lblRegTitle = New-Object System.Windows.Forms.Label
+    $lblRegTitle.Text = "REGISTRO (nativo + avancado)"
+    $lblRegTitle.AutoSize = $true; $lblRegTitle.ForeColor = $Overlay
+    $lblRegTitle.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
+    $lblRegTitle.Location = New-Object System.Drawing.Point(15, 315)
+    $pnlTab5.Controls.Add($lblRegTitle)
 
     $toolReg = New-Object System.Windows.Forms.Panel
-    $toolReg.Dock = "Top"; $toolReg.Height = 42; $toolReg.BackColor = [System.Drawing.Color]::FromArgb(40,40,58)
+    $toolReg.Location = New-Object System.Drawing.Point(10, 340); $toolReg.Size = New-Object System.Drawing.Size(950, 38)
 
     $btnAddReg = New-Object System.Windows.Forms.Button
-    $btnAddReg.Text = "+ Adicionar"; $btnAddReg.Location = New-Object System.Drawing.Point(10, 6)
-    $btnAddReg.Size = New-Object System.Drawing.Size(120, 30); $btnAddReg.BackColor = $Green; $btnAddReg.ForeColor = $BgDark
+    $btnAddReg.Text = "+ Regra de Registro"; $btnAddReg.Location = New-Object System.Drawing.Point(5, 4)
+    $btnAddReg.Size = New-Object System.Drawing.Size(160, 30); $btnAddReg.BackColor = $BgField; $btnAddReg.ForeColor = $FgText
     $btnAddReg.FlatStyle = "Flat"; $btnAddReg.Cursor = [System.Windows.Forms.Cursors]::Hand
     $toolReg.Controls.Add($btnAddReg)
 
     $btnRemoveReg = New-Object System.Windows.Forms.Button
-    $btnRemoveReg.Text = "Remover"; $btnRemoveReg.Location = New-Object System.Drawing.Point(140, 6)
+    $btnRemoveReg.Text = "Remover"; $btnRemoveReg.Location = New-Object System.Drawing.Point(175, 4)
     $btnRemoveReg.Size = New-Object System.Drawing.Size(100, 30); $btnRemoveReg.BackColor = $Red; $btnRemoveReg.ForeColor = [System.Drawing.Color]::White
     $btnRemoveReg.FlatStyle = "Flat"; $btnRemoveReg.Cursor = [System.Windows.Forms.Cursors]::Hand
     $toolReg.Controls.Add($btnRemoveReg)
-    $tabReg.Controls.Add($toolReg)
+    $pnlTab5.Controls.Add($toolReg)
 
     $dgvReg = New-Object System.Windows.Forms.DataGridView
-    $dgvReg.Dock = "Fill"
+    $dgvReg.Location = New-Object System.Drawing.Point(15, 382); $dgvReg.Size = New-Object System.Drawing.Size(940, 180)
     $dgvReg.BackgroundColor = $BgDark; $dgvReg.ForeColor = $FgText; $dgvReg.GridColor = $BgField
-    $dgvReg.BorderStyle = "None"; $dgvReg.CellBorderStyle = "SingleHorizontal"
+    $dgvReg.BorderStyle = "FixedSingle"; $dgvReg.CellBorderStyle = "SingleHorizontal"
     $dgvReg.ColumnHeadersDefaultCellStyle.BackColor = $BgPanel; $dgvReg.ColumnHeadersDefaultCellStyle.ForeColor = $Accent
     $dgvReg.DefaultCellStyle.BackColor = $BgDark; $dgvReg.DefaultCellStyle.ForeColor = $FgText
     $dgvReg.DefaultCellStyle.SelectionBackColor = [System.Drawing.Color]::FromArgb(60,60,90)
+    $dgvReg.AlternatingRowsDefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(36, 36, 54)
     $dgvReg.RowHeadersVisible = $false; $dgvReg.AllowUserToAddRows = $false
     $dgvReg.SelectionMode = "FullRowSelect"; $dgvReg.AutoSizeColumnsMode = "Fill"
     $dgvReg.EnableHeadersVisualStyles = $false; $dgvReg.ReadOnly = $true
+    $dgvReg.Anchor = "Top,Left,Right"
 
     $dgvReg.Columns.Add("Hive", "Hive") | Out-Null
     $dgvReg.Columns.Add("Key", "Caminho") | Out-Null
@@ -3021,7 +3702,6 @@ function Edit-GPO {
     $dgvReg.Columns["ValueName"].FillWeight = 20; $dgvReg.Columns["ValueData"].FillWeight = 24; $dgvReg.Columns["Type"].FillWeight = 10
 
     $script:regEntries = [System.Collections.ArrayList]@()
-    # Carregar regras salvas
     $regFile = "$sysvolPath\Machine\registry_rules.json"
     if ($sysvolPath -and (Test-Path $regFile)) {
         try {
@@ -3034,8 +3714,115 @@ function Edit-GPO {
         } catch {}
     }
 
-    $tabReg.Controls.Add($dgvReg)
+    # Carregar entradas nativas do Registry.pol que NAO foram mapeadas
+    foreach ($nr in $script:nativeRegEntries) {
+        $alreadyListed = $false
+        foreach ($e in $script:regEntries) {
+            if ($e.Key -eq $nr.Key -and $e.ValueName -eq $nr.ValueName) { $alreadyListed = $true; break }
+        }
+        # Tambem ignorar se ja foi mapeado para Politicas Comuns
+        $isMapped = $false
+        foreach ($pol in $commonPolicies) {
+            if ($nr.Key -like "*$($pol.Key)*" -and $nr.ValueName -eq $pol.Val) { $isMapped = $true; break }
+        }
+        if (-not $alreadyListed -and -not $isMapped) {
+            $entry = @{ Hive=$nr.Hive; Key=$nr.Key; ValueName=$nr.ValueName; ValueData=$nr.ValueData; Type=$nr.Type }
+            $script:regEntries.Add($entry) | Out-Null
+            $rowIdx = $dgvReg.Rows.Add($nr.Hive, $nr.Key, $nr.ValueName, $nr.ValueData, $nr.Type)
+            $dgvReg.Rows[$rowIdx].DefaultCellStyle.ForeColor = $Yellow
+        }
+    }
+
+    $pnlTab5.Controls.Add($dgvReg)
+
+    $tabReg.Controls.Add($pnlTab5)
     $tabs.TabPages.Add($tabReg)
+
+    # ════════════════════════════════════════
+    #  TAB 6: PREFERENCIAS (GPP)
+    # ════════════════════════════════════════
+    $tabPref = New-Object System.Windows.Forms.TabPage
+    $tabPref.Text = "  Preferencias (GPP)  "
+    $tabPref.BackColor = $BgDark
+
+    # Painel header com labels (altura fixa, nao Dock)
+    $pnlPrefHeader = New-Object System.Windows.Forms.Panel
+    $pnlPrefHeader.Dock = "Top"; $pnlPrefHeader.Height = 58; $pnlPrefHeader.BackColor = $BgDark
+
+    $lblPrefTitle = New-Object System.Windows.Forms.Label
+    $lblPrefTitle.Text = "PREFERENCIAS NATIVAS (GROUP POLICY PREFERENCES)"
+    $lblPrefTitle.Font = New-Object System.Drawing.Font("Segoe UI", 12, [System.Drawing.FontStyle]::Bold)
+    $lblPrefTitle.ForeColor = $Accent; $lblPrefTitle.AutoSize = $true
+    $lblPrefTitle.Location = New-Object System.Drawing.Point(15, 8)
+    $pnlPrefHeader.Controls.Add($lblPrefTitle)
+
+    $lblPrefDesc = New-Object System.Windows.Forms.Label
+    $lblPrefDesc.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $lblPrefDesc.AutoSize = $true
+    $lblPrefDesc.Location = New-Object System.Drawing.Point(15, 34)
+
+    $prefCount = $script:nativePreferences.Count
+    if ($prefCount -gt 0) {
+        $tipos = ($script:nativePreferences | ForEach-Object { $_.Tipo } | Sort-Object -Unique) -join ", "
+        $lblPrefDesc.Text = "$prefCount configuracao(oes) encontrada(s): $tipos"
+        $lblPrefDesc.ForeColor = $Green
+    } else {
+        $lblPrefDesc.Text = "Nenhuma preferencia nativa encontrada nesta GPO. (Atalhos, Drives, Impressoras, Arquivos, etc)"
+        $lblPrefDesc.ForeColor = $Overlay
+    }
+    $pnlPrefHeader.Controls.Add($lblPrefDesc)
+
+    $dgvPref = New-Object System.Windows.Forms.DataGridView
+    $dgvPref.Dock = "Fill"
+    $dgvPref.BackgroundColor = $BgDark; $dgvPref.GridColor = $Overlay; $dgvPref.ForeColor = $FgText
+    $dgvPref.DefaultCellStyle.BackColor = $BgField; $dgvPref.DefaultCellStyle.ForeColor = $FgText
+    $dgvPref.DefaultCellStyle.SelectionBackColor = $Accent; $dgvPref.DefaultCellStyle.SelectionForeColor = $BgDark
+    $dgvPref.ColumnHeadersDefaultCellStyle.BackColor = $BgPanel; $dgvPref.ColumnHeadersDefaultCellStyle.ForeColor = $Accent
+    $dgvPref.ColumnHeadersDefaultCellStyle.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+    $dgvPref.EnableHeadersVisualStyles = $false
+    $dgvPref.RowHeadersVisible = $false; $dgvPref.AllowUserToAddRows = $false
+    $dgvPref.ReadOnly = $true; $dgvPref.SelectionMode = "FullRowSelect"
+    $dgvPref.AutoSizeColumnsMode = "None"; $dgvPref.RowTemplate.Height = 28
+    $dgvPref.BorderStyle = "None"; $dgvPref.CellBorderStyle = "SingleHorizontal"
+
+    $dgvPref.Columns.Add("Tipo", "Tipo") | Out-Null
+    $dgvPref.Columns.Add("Escopo", "Escopo") | Out-Null
+    $dgvPref.Columns.Add("Acao", "Acao") | Out-Null
+    $dgvPref.Columns.Add("Nome", "Nome") | Out-Null
+    $dgvPref.Columns.Add("Caminho", "Caminho / Valor") | Out-Null
+    $dgvPref.Columns.Add("Detalhes", "Detalhes") | Out-Null
+
+    $dgvPref.Columns["Tipo"].Width = 120; $dgvPref.Columns["Tipo"].MinimumWidth = 100
+    $dgvPref.Columns["Escopo"].Width = 90; $dgvPref.Columns["Escopo"].MinimumWidth = 80
+    $dgvPref.Columns["Acao"].Width = 95; $dgvPref.Columns["Acao"].MinimumWidth = 80
+    $dgvPref.Columns["Nome"].Width = 200; $dgvPref.Columns["Nome"].AutoSizeMode = "Fill"; $dgvPref.Columns["Nome"].FillWeight = 25; $dgvPref.Columns["Nome"].MinimumWidth = 120
+    $dgvPref.Columns["Caminho"].AutoSizeMode = "Fill"; $dgvPref.Columns["Caminho"].FillWeight = 45; $dgvPref.Columns["Caminho"].MinimumWidth = 200
+    $dgvPref.Columns["Detalhes"].AutoSizeMode = "Fill"; $dgvPref.Columns["Detalhes"].FillWeight = 30; $dgvPref.Columns["Detalhes"].MinimumWidth = 150
+
+    # Cores por tipo de acao
+    $actColors = @{
+        "Criar"       = $Green
+        "Atualizar"   = $Accent
+        "Substituir"  = $Yellow
+        "Deletar"     = $Red
+    }
+    $typeColors = @{ "Atalho"=$Mauve; "Drive Mapeado"=$Green; "Impressora"=$Accent; "Arquivo"=$Yellow; "Pasta"=$Yellow; "Servico"=$Red; "Grupo/Usuario"=$Red; "Registro (Pref)"=$Yellow; "Energia"=$Overlay; "Redir. Pasta"=$Green; "Seguranca"=$Red; "Privilegio"=$Mauve; "Membro Grupo"=$Red; "Reg. Seguranca"=$Yellow; "Perm. Registro"=$Yellow; "Perm. Arquivo"=$Yellow; "Software (MSI)"=$Green }
+
+    foreach ($pref in $script:nativePreferences) {
+        $rowIdx = $dgvPref.Rows.Add($pref.Tipo, $pref.Escopo, $pref.Acao, $pref.Nome, $pref.Caminho, $pref.Detalhes)
+        if ($actColors[$pref.Acao]) {
+            $dgvPref.Rows[$rowIdx].Cells["Acao"].Style.ForeColor = $actColors[$pref.Acao]
+        }
+        if ($typeColors[$pref.Tipo]) {
+            $dgvPref.Rows[$rowIdx].Cells["Tipo"].Style.ForeColor = $typeColors[$pref.Tipo]
+        }
+    }
+
+    $tabPref.Controls.Add($dgvPref)
+    $tabPref.Controls.Add($pnlPrefHeader)
+    $pnlPrefHeader.BringToFront()
+
+    $tabs.TabPages.Add($tabPref)
 
     # ════════════════════════════════════════
     #  BARRA INFERIOR (Salvar/Cancelar)
@@ -3072,7 +3859,59 @@ function Edit-GPO {
     #  EVENTOS
     # ════════════════════════════════════════
 
-    # Adicionar regra customizada
+    # Adicionar software/instalador
+    $btnAddInst.Add_Click({
+        $instDlg = New-Object System.Windows.Forms.Form
+        $instDlg.Text = "Adicionar Software"; $instDlg.Size = New-Object System.Drawing.Size(580, 280)
+        $instDlg.StartPosition = "CenterParent"; $instDlg.BackColor = $BgPanel; $instDlg.ForeColor = $FgText
+        $instDlg.FormBorderStyle = "FixedDialog"; $instDlg.MaximizeBox = $false
+
+        $iy = 15
+        $il1 = New-Object System.Windows.Forms.Label; $il1.Text = "Nome do Software:"; $il1.AutoSize = $true
+        $il1.Location = New-Object System.Drawing.Point(15, $iy); $il1.ForeColor = $Accent; $instDlg.Controls.Add($il1); $iy += 22
+        $tInstName = New-Object System.Windows.Forms.TextBox; $tInstName.Location = New-Object System.Drawing.Point(15, $iy)
+        $tInstName.Size = New-Object System.Drawing.Size(530, 25); $tInstName.BackColor = $BgField; $tInstName.ForeColor = $FgText
+        $tInstName.Font = New-Object System.Drawing.Font("Segoe UI", 10)
+        $instDlg.Controls.Add($tInstName); $iy += 38
+
+        $il2 = New-Object System.Windows.Forms.Label; $il2.Text = "Caminho ou URL do instalador:"; $il2.AutoSize = $true
+        $il2.Location = New-Object System.Drawing.Point(15, $iy); $il2.ForeColor = $Accent; $instDlg.Controls.Add($il2); $iy += 22
+        $tInstPath = New-Object System.Windows.Forms.TextBox; $tInstPath.Location = New-Object System.Drawing.Point(15, $iy)
+        $tInstPath.Size = New-Object System.Drawing.Size(530, 25); $tInstPath.BackColor = $BgField; $tInstPath.ForeColor = $FgText
+        $tInstPath.Font = New-Object System.Drawing.Font("Segoe UI", 10)
+        $instDlg.Controls.Add($tInstPath); $iy += 38
+
+        $il3 = New-Object System.Windows.Forms.Label; $il3.Text = "Argumentos (opcional):    Ex: /silent /norestart"; $il3.AutoSize = $true
+        $il3.Location = New-Object System.Drawing.Point(15, $iy); $il3.ForeColor = $Overlay; $instDlg.Controls.Add($il3); $iy += 22
+        $tInstArgs = New-Object System.Windows.Forms.TextBox; $tInstArgs.Location = New-Object System.Drawing.Point(15, $iy)
+        $tInstArgs.Size = New-Object System.Drawing.Size(530, 25); $tInstArgs.BackColor = $BgField; $tInstArgs.ForeColor = $FgText
+        $tInstArgs.Font = New-Object System.Drawing.Font("Segoe UI", 10)
+        $instDlg.Controls.Add($tInstArgs); $iy += 38
+
+        $bAddInst = New-Object System.Windows.Forms.Button; $bAddInst.Text = "Adicionar"; $bAddInst.Size = New-Object System.Drawing.Size(140, 35)
+        $bAddInst.Location = New-Object System.Drawing.Point(215, $iy); $bAddInst.BackColor = $Green; $bAddInst.ForeColor = $BgDark
+        $bAddInst.FlatStyle = "Flat"; $bAddInst.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
+        $bAddInst.DialogResult = "OK"; $instDlg.Controls.Add($bAddInst)
+        $instDlg.AcceptButton = $bAddInst
+
+        if ($instDlg.ShowDialog() -eq "OK" -and $tInstPath.Text.Trim()) {
+            $name = if ($tInstName.Text.Trim()) { $tInstName.Text.Trim() } else { [System.IO.Path]::GetFileName($tInstPath.Text.Trim()) }
+            $entry = @{ Name=$name; Path=$tInstPath.Text.Trim(); Args=$tInstArgs.Text.Trim() }
+            $script:installEntries.Add($entry) | Out-Null
+            $dgvInst.Rows.Add($entry.Name, $entry.Path, $entry.Args) | Out-Null
+        }
+        $instDlg.Dispose()
+    })
+
+    $btnRemoveInst.Add_Click({
+        if ($dgvInst.SelectedRows.Count -gt 0) {
+            $idx = $dgvInst.SelectedRows[0].Index
+            $dgvInst.Rows.RemoveAt($idx)
+            if ($idx -lt $script:installEntries.Count) { $script:installEntries.RemoveAt($idx) }
+        }
+    })
+
+    # Adicionar regra customizada de registro
     $btnAddReg.Add_Click({
         $regDlg = New-Object System.Windows.Forms.Form
         $regDlg.Text = "Nova Regra de Registro"; $regDlg.Size = New-Object System.Drawing.Size(550, 330)
@@ -3203,6 +4042,13 @@ function Edit-GPO {
                     $regFilePath = "$machPath\registry_rules.json"
                     $script:regEntries | ConvertTo-Json -Depth 5 | Out-File -FilePath $regFilePath -Encoding UTF8
                     $changes += "$($script:regEntries.Count) regras registro"
+                }
+
+                # 7) Salvar instalacoes de software
+                if ($script:installEntries.Count -gt 0) {
+                    $instFilePath = "$machPath\install_scripts.json"
+                    $script:installEntries | ConvertTo-Json -Depth 5 | Out-File -FilePath $instFilePath -Encoding UTF8
+                    $changes += "$($script:installEntries.Count) instalacoes"
                 }
             }
 
