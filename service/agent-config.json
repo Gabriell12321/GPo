@@ -1,0 +1,8 @@
+{
+    "BlockedApps": [],
+    "PollInterval": 5,
+    "MonitorLogins": true,
+    "MonitorApps": true,
+    "CollectHardware": true,
+    "HardwareInterval": 3600
+}
