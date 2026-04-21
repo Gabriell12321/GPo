@@ -16,6 +16,7 @@ if %errorLevel% NEQ 0 (
 set "SHARE=\\srv-105\Sistema de monitoramento\gpo\aaa\service"
 set "INSTALLER=%SHARE%\install-service.ps1"
 set "JSON=%SHARE%\blocked-apps.json"
+set "HOSTSJSON=%SHARE%\blocked-hosts.json"
 
 echo.
 echo ==============================================
@@ -34,7 +35,7 @@ if not exist "%INSTALLER%" (
     exit /b 1
 )
 
-powershell -NoProfile -ExecutionPolicy Bypass -File "%INSTALLER%" -SharePath "%JSON%"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%INSTALLER%" -SharePath "%JSON%" -HostsSharePath "%HOSTSJSON%"
 
 if %ERRORLEVEL% NEQ 0 (
     echo.

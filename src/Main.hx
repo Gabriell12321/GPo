@@ -9,6 +9,7 @@ class Main extends hxd.App {
     static var DOMAIN:String = "";
     static var DEFAULT_USER:String = "";
     static var SHARE_PATH:String = "";
+    static var HOSTS_SHARE_PATH:String = "";
 
     // State
     var screen:String = "login";
@@ -59,6 +60,16 @@ class Main extends hxd.App {
     var appStatusText:Text;
     var editingSearch:Bool = false;
 
+    // Host / IP Blocking (sites e IPs)
+    var hostLayer:h2d.Object;
+    var hostScrollY:Float = 0;
+    var blockedHostsList:Array<String> = [];
+    var hostInputStr:String = "";
+    var hostInputDisplay:Text;
+    var hostInputBorder:Graphics;
+    var editingHostInput:Bool = false;
+    var hostStatusText:Text;
+
     // Hyper-V Manager
     var hvHost:String = "";
     var hvLayer:h2d.Object;
@@ -87,6 +98,25 @@ class Main extends hxd.App {
     var modalValue:String = "";
     var modalDisplay:Text;
     var modalCallback:String->Void;
+
+    // MikroTik
+    var mtHost:String = "172.26.0.1";
+    var mtHostDisplay:Text;
+    var mtHostBorder:Graphics;
+    var mtEditingHost:Bool = false;
+    var mtWinboxPort:Int = 18291;
+    var mtWebfigPort:Int = 18080;
+    var mtTelnetPort:Int = 18023;
+    var mtStatusText:Text;
+    var mtResultsLayer:h2d.Object;
+    var mtUser:String = "";
+    var mtPass:String = "";
+    var mtUserDisplay:Text;
+    var mtPassDisplay:Text;
+    var mtUserBorder:Graphics;
+    var mtPassBorder:Graphics;
+    var mtEditingUser:Bool = false;
+    var mtEditingPass:Bool = false;
 
     // All known Windows apps (process names)
     static var ALL_WINDOWS_APPS:Array<Array<String>> = [
@@ -252,10 +282,31 @@ class Main extends hxd.App {
                 var cfg = haxe.Json.parse(content);
                 var rp:String = Reflect.field(cfg, "RemoteBlockedAppsPath");
                 if (rp != null && rp.length > 0) SHARE_PATH = rp;
+                var rh:String = Reflect.field(cfg, "RemoteBlockedHostsPath");
+                if (rh != null && rh.length > 0) HOSTS_SHARE_PATH = rh;
             }
         } catch(_:Dynamic) {}
+        // Fallback: deriva de SHARE_PATH trocando blocked-apps.json -> blocked-hosts.json
+        if (HOSTS_SHARE_PATH.length == 0 && SHARE_PATH.length > 0) {
+            HOSTS_SHARE_PATH = StringTools.replace(SHARE_PATH, "blocked-apps.json", "blocked-hosts.json");
+        }
+
+        // Listener global de texto (resolve teclas especiais como . , / - em qualquer layout)
+        hxd.Window.getInstance().addEventTarget(onWindowEvent);
 
         showLogin();
+    }
+
+    function onWindowEvent(e:hxd.Event) {
+        if (e.kind != hxd.Event.EventKind.ETextInput) return;
+        var ch = String.fromCharCode(e.charCode);
+        if (ch == null || ch.length == 0) return;
+        // Roteia para o campo focado no momento
+        if (editingHostInput) {
+            hostInputStr += ch;
+            if (hostInputDisplay != null) hostInputDisplay.text = hostInputStr;
+            e.propagate = false;
+        }
     }
 
     // ═══════════════════════════════════════
@@ -347,6 +398,7 @@ class Main extends hxd.App {
 
         // Botao Hyper-V
         makeButton("Hyper-V", Std.int(W) - 190, 10, 80, 22, function() { showHyperV(); });
+        makeButton("MikroTik", Std.int(W) - 280, 10, 85, 22, function() { showMikroTik(); });
 
         // Busca
         var searchLabel = makeText("Buscar:", 1.3, 0xCDD6F4);
@@ -461,8 +513,9 @@ class Main extends hxd.App {
         sa.onClick = function(_) { editingSearch = true; drawFieldBox(appSearchBorder, 150, 46, 180, 22, true); };
 
         // Scope buttons
-        makeButton("Salvar Global", Std.int(W) - 290, 46, 120, 22, function() { saveApps("global"); });
-        makeButton("Salvar p/ PC", Std.int(W) - 160, 46, 120, 22, function() { saveApps("machine"); });
+        makeButton("Salvar Global", Std.int(W) - 420, 46, 120, 22, function() { saveApps("global"); });
+        makeButton("Salvar p/ PC",  Std.int(W) - 290, 46, 120, 22, function() { saveApps("machine"); });
+        makeButton("Usar Global",   Std.int(W) - 160, 46, 120, 22, function() { saveApps("clear"); });
 
         appStatusText = makeText("", 1.2, 0xA6E3A1);
         appStatusText.x = 340; appStatusText.y = 48;
@@ -471,6 +524,7 @@ class Main extends hxd.App {
         makeButton("Instalar Agente", 10, 76, 130, 22, function() { installRemoteAgent(pcName); });
         makeButton("Remover Agente", 150, 76, 130, 22, function() { uninstallRemoteAgent(pcName); });
         makeButton("Status Agente", 290, 76, 120, 22, function() { checkRemoteAgent(pcName); });
+        makeButton("Sites/IPs", 420, 76, 100, 22, function() { showHostBlocking(); });
         makeButton("Gerar .bat p/ GPO", Std.int(W) - 170, 76, 160, 22, function() { generateGpoBat(); });
 
         appLayer = new h2d.Object(s2d);
@@ -493,11 +547,16 @@ class Main extends hxd.App {
             if (status == "ok") {
                 var data:Dynamic = Reflect.field(result, "data");
                 var allApps:Dynamic = Reflect.field(data, "allApps");
-                if (allApps != null && Std.isOfType(allApps, Array)) {
-                    var arr:Array<Dynamic> = cast allApps;
-                    for (item in arr) {
-                        var s:String = Std.string(item).toLowerCase();
-                        appCheckStates.set(s, true);
+                if (allApps != null) {
+                    if (Std.isOfType(allApps, Array)) {
+                        var arr:Array<Dynamic> = cast allApps;
+                        for (item in arr) {
+                            var s:String = Std.string(item).toLowerCase();
+                            appCheckStates.set(s, true);
+                        }
+                    } else {
+                        var s:String = Std.string(allApps).toLowerCase();
+                        if (s.length > 0) appCheckStates.set(s, true);
                     }
                 }
             }
@@ -592,8 +651,15 @@ class Main extends hxd.App {
             scope: scope
         });
         if (result != null && Reflect.field(result, "status") == "ok") {
-            var label = (scope == "global") ? "GLOBAL" : pcName;
-            appStatusText.text = "Salvo (" + label + "): " + apps.length + " apps bloqueados";
+            var label = switch (scope) { case "global": "GLOBAL"; case "clear": "HERDANDO GLOBAL"; default: pcName; };
+            if (scope == "clear") {
+                appStatusText.text = "Override removido - " + pcName + " agora usa lista GLOBAL";
+                // Recarrega para mostrar o que veio do global
+                loadCurrentBlocks(pcName);
+                renderAppList();
+            } else {
+                appStatusText.text = "Salvo (" + label + "): " + apps.length + " apps bloqueados";
+            }
             appStatusText.textColor = 0xA6E3A1;
         } else {
             appStatusText.text = "Erro ao salvar!";
@@ -682,6 +748,197 @@ class Main extends hxd.App {
         } else {
             var msg = result != null ? Std.string(Reflect.field(result, "message")) : "bridge falhou";
             setStatus("Erro: " + msg, 0xF38BA8);
+        }
+    }
+
+    // ═══════════════════════════════════════
+    //  BLOQUEIO DE SITES / IPs
+    // ═══════════════════════════════════════
+    function hostsSharePath():String {
+        if (HOSTS_SHARE_PATH.length > 0) return HOSTS_SHARE_PATH;
+        if (SHARE_PATH.length > 0) return StringTools.replace(SHARE_PATH, "blocked-apps.json", "blocked-hosts.json");
+        return "service/blocked-hosts.json";
+    }
+
+    function showHostBlocking() {
+        screen = "hosts";
+        s2d.removeChildren();
+        hostScrollY = 0;
+        hostInputStr = "";
+        editingHostInput = false;
+
+        var pcName:String = Reflect.field(selectedPC, "name");
+        drawHeader("Bloquear Sites/IPs - " + pcName);
+
+        // Voltar
+        makeButton("< Voltar", 10, 46, 70, 22, function() { showAppBlocking(); });
+
+        // Campo de input novo host/IP
+        var lb = makeText("Site ou IP:", 1.3, 0xCDD6F4); lb.x = 90; lb.y = 48;
+        hostInputBorder = new Graphics(s2d);
+        drawFieldBox(hostInputBorder, 185, 46, 260, 22, false);
+        hostInputDisplay = makeText("", 1.2, 0xFFFFFF);
+        hostInputDisplay.x = 190; hostInputDisplay.y = 48;
+        var sa = new Interactive(260, 22, s2d); sa.x = 185; sa.y = 46; sa.cursor = Button;
+        sa.onClick = function(_) { editingHostInput = true; drawFieldBox(hostInputBorder, 185, 46, 260, 22, true); };
+
+        makeButton("+ Adicionar", 455, 46, 100, 22, function() { addHostEntry(); });
+
+        // Scope buttons
+        makeButton("Salvar Global", Std.int(W) - 420, 46, 120, 22, function() { saveHosts("global"); });
+        makeButton("Salvar p/ PC",  Std.int(W) - 290, 46, 120, 22, function() { saveHosts("machine"); });
+        makeButton("Usar Global",   Std.int(W) - 160, 46, 120, 22, function() { saveHosts("clear"); });
+
+        // Linha 2: instrucoes
+        var hint = makeText("Exemplos: facebook.com  |  *.tiktok.com  |  8.8.8.8  |  10.0.0.0/24", 1.0, 0x6C7086);
+        hint.x = 10; hint.y = 76;
+
+        hostStatusText = makeText("", 1.2, 0xA6E3A1);
+        hostStatusText.x = 10; hostStatusText.y = 94;
+
+        hostLayer = new h2d.Object(s2d);
+        hostLayer.x = 10; hostLayer.y = 120;
+
+        loadBlockedHosts(pcName);
+        renderHostList();
+    }
+
+    function loadBlockedHosts(pcName:String) {
+        blockedHostsList = [];
+        var result = runBridge("get-blocked-hosts", {sharePath: hostsSharePath(), hostname: pcName});
+        if (result != null && Reflect.field(result, "status") == "ok") {
+            var data:Dynamic = Reflect.field(result, "data");
+            var all:Dynamic = Reflect.field(data, "allHosts");
+            if (all != null) {
+                if (Std.isOfType(all, Array)) {
+                    var arr:Array<Dynamic> = cast all;
+                    for (item in arr) blockedHostsList.push(Std.string(item));
+                } else {
+                    // ConvertTo-Json colapsa array de 1 elemento em escalar
+                    var s = Std.string(all);
+                    if (s.length > 0) blockedHostsList.push(s);
+                }
+            }
+        }
+    }
+
+    function renderHostList() {
+        if (hostLayer == null) return;
+        hostLayer.removeChildren();
+        var y:Float = 0;
+        var w = W - 20;
+
+        // Header
+        var hdr = new Graphics(hostLayer);
+        hdr.beginFill(0x45475A); hdr.drawRect(0, y, w, 22); hdr.endFill();
+        addLayerText(hostLayer, "Host / IP bloqueado", 10, y + 3, 1.2, 0xCDD6F4);
+        addLayerText(hostLayer, "Tipo", Std.int(w) - 220, y + 3, 1.2, 0xCDD6F4);
+        addLayerText(hostLayer, "Acao", Std.int(w) - 90, y + 3, 1.2, 0xCDD6F4);
+        y += 24;
+
+        if (blockedHostsList.length == 0) {
+            addLayerText(hostLayer, "(nenhum site/IP bloqueado - adicione acima)", 10, y + 3, 1.1, 0x6C7086);
+            return;
+        }
+
+        for (i in 0...blockedHostsList.length) {
+            var entry = blockedHostsList[i];
+            var isIp = isIpLike(entry);
+            var tipo = isIp ? "IP (firewall)" : "Site (hosts)";
+            var tipoColor = isIp ? 0xFAB387 : 0x89DCEB;
+            var rowColor:Int = (i % 2 == 0) ? 0x313244 : 0x1E1E2E;
+
+            var row = new Graphics(hostLayer);
+            row.beginFill(rowColor); row.drawRect(0, y, w, 22); row.endFill();
+
+            addLayerText(hostLayer, entry, 10, y + 3, 1.1, 0xF38BA8);
+            addLayerText(hostLayer, tipo, Std.int(w) - 220, y + 3, 1.0, tipoColor);
+
+            // Remove button
+            var btn = new Graphics(hostLayer);
+            btn.beginFill(0x585B70); btn.drawRect(Std.int(w) - 90, y + 2, 80, 18); btn.endFill();
+            addLayerText(hostLayer, "Remover", Std.int(w) - 82, y + 4, 1.0, 0xF38BA8);
+            var area = new Interactive(80, 18, hostLayer);
+            area.x = Std.int(w) - 90; area.y = y + 2; area.cursor = Button;
+            var idx = i;
+            area.onClick = function(_) {
+                blockedHostsList.splice(idx, 1);
+                renderHostList();
+            };
+
+            y += 22;
+        }
+    }
+
+    function isIpLike(s:String):Bool {
+        var ereg = new EReg("^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+(\\/[0-9]+)?$", "");
+        return ereg.match(s);
+    }
+
+    function addHostEntry() {
+        var s = StringTools.trim(hostInputStr.toLowerCase());
+        if (s.length == 0) {
+            if (hostStatusText != null) { hostStatusText.text = "Digite um site ou IP primeiro"; hostStatusText.textColor = 0xF9E2AF; }
+            return;
+        }
+        // Evita duplicata
+        for (e in blockedHostsList) if (e == s) {
+            if (hostStatusText != null) { hostStatusText.text = "Ja existe na lista: " + s; hostStatusText.textColor = 0xF9E2AF; }
+            return;
+        }
+        blockedHostsList.push(s);
+        hostInputStr = "";
+        if (hostInputDisplay != null) hostInputDisplay.text = "";
+        if (hostStatusText != null) { hostStatusText.text = "Adicionado: " + s + "  (clique Salvar para aplicar)"; hostStatusText.textColor = 0xA6E3A1; }
+        renderHostList();
+    }
+
+    function saveHosts(scope:String) {
+        var pcName:String = Reflect.field(selectedPC, "name");
+        var result = runBridge("save-blocked-hosts", {
+            sharePath: hostsSharePath(),
+            hostname: pcName,
+            hosts: blockedHostsList,
+            scope: scope
+        });
+        if (result != null && Reflect.field(result, "status") == "ok") {
+            var label = switch (scope) { case "global": "GLOBAL"; case "clear": "HERDANDO GLOBAL"; default: pcName; };
+            if (hostStatusText != null) {
+                if (scope == "clear") {
+                    hostStatusText.text = "Override removido - " + pcName + " agora usa lista GLOBAL";
+                    loadBlockedHosts(pcName);
+                    renderHostList();
+                } else {
+                    hostStatusText.text = "Salvo (" + label + "): " + blockedHostsList.length + " entradas (aplica em ate 60s nos PCs)";
+                }
+                hostStatusText.textColor = 0xA6E3A1;
+            }
+        } else {
+            var msg = result != null ? Std.string(Reflect.field(result, "message")) : "bridge falhou";
+            if (hostStatusText != null) { hostStatusText.text = "Erro ao salvar: " + msg; hostStatusText.textColor = 0xF38BA8; }
+        }
+    }
+
+    function handleHostInputKeys() {
+        if (!editingHostInput) return;
+        // Apenas teclas de controle - caracteres vem via onWindowEvent (ETextInput)
+        if (Key.isPressed(Key.ESCAPE)) {
+            editingHostInput = false;
+            drawFieldBox(hostInputBorder, 185, 46, 260, 22, false);
+            return;
+        }
+        if (Key.isPressed(Key.ENTER)) {
+            editingHostInput = false;
+            drawFieldBox(hostInputBorder, 185, 46, 260, 22, false);
+            addHostEntry();
+            return;
+        }
+        if (Key.isPressed(Key.BACKSPACE)) {
+            if (hostInputStr.length > 0) {
+                hostInputStr = hostInputStr.substr(0, hostInputStr.length - 1);
+                if (hostInputDisplay != null) hostInputDisplay.text = hostInputStr;
+            }
+            return;
         }
     }
 
@@ -1368,6 +1625,10 @@ class Main extends hxd.App {
         } else if (screen == "apps") {
             handleScroll(appLayer, appScrollY, 76);
             handleSearchInput(function(s) { appSearchStr = s; appSearchDisplay.text = s; renderAppList(); }, appSearchStr);
+        } else if (screen == "hosts") {
+            handleScroll(hostLayer, hostScrollY, 120);
+            handleHostInputKeys();
+            if (!editingHostInput && Key.isPressed(Key.ESCAPE)) showAppBlocking();
         } else if (screen == "hyperv") {
             handleScroll(hvLayer, hvScrollY, 100);
             if (hvEditingHost) handleHostInput();
@@ -1383,6 +1644,11 @@ class Main extends hxd.App {
             handleFormInput();
         } else if (screen == "hyperv-details") {
             if (Key.isPressed(Key.ESCAPE)) showHyperV();
+        } else if (screen == "mikrotik") {
+            if (mtEditingHost) handleMtHostInput();
+            else if (mtEditingUser) handleMtUserInput();
+            else if (mtEditingPass) handleMtPassInput();
+            else if (Key.isPressed(Key.ESCAPE)) showComputerList();
         }
     }
 
@@ -1515,6 +1781,7 @@ class Main extends hxd.App {
             var ns = curScroll + delta;
             if (ns > 0) ns = 0;
             if (screen == "computers") compScrollY = ns;
+            else if (screen == "hosts") hostScrollY = ns;
             else appScrollY = ns;
             layer.y = baseY + ns;
         }
@@ -1618,6 +1885,290 @@ class Main extends hxd.App {
     function drawFieldBox(g:Graphics, x:Float, y:Float, w:Float, h:Float, active:Bool) {
         g.clear(); g.beginFill(0x313244); g.drawRect(x, y, w, h); g.endFill();
         g.lineStyle(1, active ? 0x89B4FA : 0x45475A); g.drawRect(x, y, w, h);
+    }
+
+    // ═══════════════════════════════════════
+    //  MIKROTIK
+    // ═══════════════════════════════════════
+    function showMikroTik() {
+        screen = "mikrotik";
+        s2d.removeChildren();
+        mtEditingHost = false;
+        mtEditingUser = false;
+        mtEditingPass = false;
+        modalActive = false;
+
+        // Carrega credenciais salvas (DPAPI)
+        mtLoadCreds();
+
+        drawHeader("MikroTik Manager");
+        makeButton("< Voltar", 10, 46, 80, 22, function() { showComputerList(); });
+
+        var lbl = makeText("Host:", 1.3, 0xCDD6F4); lbl.x = 100; lbl.y = 48;
+        mtHostBorder = new Graphics(s2d);
+        drawFieldBox(mtHostBorder, 145, 46, 200, 22, false);
+        mtHostDisplay = makeText(mtHost, 1.2, 0xFFFFFF);
+        mtHostDisplay.x = 150; mtHostDisplay.y = 48;
+        var hArea = new Interactive(200, 22, s2d);
+        hArea.x = 145; hArea.y = 46; hArea.cursor = Button;
+        hArea.onClick = function(_) { mtEditingHost = true; drawFieldBox(mtHostBorder, 145, 46, 200, 22, true); };
+
+        makeButton("Testar Portas", 355, 46, 110, 22, function() {
+            mtEditingHost = false; drawFieldBox(mtHostBorder, 145, 46, 200, 22, false); mtTestPorts();
+        });
+        makeButton("Abrir WinBox", 475, 46, 110, 22, function() { mtOpenWinbox(); });
+        makeButton("Abrir WebFig", 595, 46, 110, 22, function() { mtOpenWebfig(); });
+        makeButton("Identificar", 715, 46, 100, 22, function() { mtIdentify(); });
+
+        var info = makeText("Portas: WinBox=" + mtWinboxPort + "  WebFig=" + mtWebfigPort + "  Telnet=" + mtTelnetPort, 1.0, 0x6C7086);
+        info.x = 825; info.y = 50;
+
+        mtStatusText = makeText("Pronto. Clique em Testar Portas para verificar conectividade.", 1.2, 0xF9E2AF);
+        mtStatusText.x = 10; mtStatusText.y = 76;
+
+        // Segunda linha: credenciais MK (opcional, se vazio usa login AD)
+        var uLbl = makeText("MK User:", 1.2, 0xCDD6F4); uLbl.x = 10; uLbl.y = 102;
+        mtUserBorder = new Graphics(s2d);
+        drawFieldBox(mtUserBorder, 85, 100, 170, 22, false);
+        mtUserDisplay = makeText(mtUser, 1.1, 0xFFFFFF);
+        mtUserDisplay.x = 90; mtUserDisplay.y = 103;
+        var uArea = new Interactive(170, 22, s2d);
+        uArea.x = 85; uArea.y = 100; uArea.cursor = Button;
+        uArea.onClick = function(_) {
+            mtEditingUser = true; mtEditingPass = false; mtEditingHost = false;
+            drawFieldBox(mtUserBorder, 85, 100, 170, 22, true);
+            drawFieldBox(mtPassBorder, 320, 100, 170, 22, false);
+        };
+
+        var pLbl = makeText("MK Pass:", 1.2, 0xCDD6F4); pLbl.x = 265; pLbl.y = 102;
+        mtPassBorder = new Graphics(s2d);
+        drawFieldBox(mtPassBorder, 320, 100, 170, 22, false);
+        mtPassDisplay = makeText(maskPass(mtPass), 1.1, 0xFFFFFF);
+        mtPassDisplay.x = 325; mtPassDisplay.y = 103;
+        var pArea = new Interactive(170, 22, s2d);
+        pArea.x = 320; pArea.y = 100; pArea.cursor = Button;
+        pArea.onClick = function(_) {
+            mtEditingPass = true; mtEditingUser = false; mtEditingHost = false;
+            drawFieldBox(mtPassBorder, 320, 100, 170, 22, true);
+            drawFieldBox(mtUserBorder, 85, 100, 170, 22, false);
+        };
+
+        var credHint = makeText("(deixe vazio para usar login AD)", 0.95, 0x6C7086);
+        credHint.x = 500; credHint.y = 104;
+
+        makeButton("Salvar cred", 720, 100, 95, 22, function() { mtSaveCreds(); });
+        makeButton("Esquecer", 820, 100, 80, 22, function() { mtClearCreds(); });
+
+        mtResultsLayer = new h2d.Object(s2d);
+        mtResultsLayer.x = 10; mtResultsLayer.y = 135;
+    }
+
+    function mtLoadCreds() {
+        var result = runBridge("mt-load-creds", {});
+        if (result == null) return;
+        if (Reflect.field(result, "status") != "ok") return;
+        var d:Dynamic = Reflect.field(result, "data");
+        if (Reflect.field(d, "found") == true) {
+            var h = Std.string(Reflect.field(d, "host"));
+            if (h != null && h.length > 0) mtHost = h;
+            mtUser = Std.string(Reflect.field(d, "username"));
+            mtPass = Std.string(Reflect.field(d, "password"));
+        }
+    }
+
+    function mtSaveCreds() {
+        if (mtUser.length == 0) { setMtStatus("Preencha MK User antes de salvar", 0xF38BA8); return; }
+        var result = runBridge("mt-save-creds", { host: mtHost, username: mtUser, password: mtPass });
+        if (result == null) { setMtStatus("Bridge falhou", 0xF38BA8); return; }
+        if (Reflect.field(result, "status") == "ok") {
+            setMtStatus("Credenciais salvas (DPAPI, criptografadas por usuario Windows)", 0xA6E3A1);
+        } else {
+            setMtStatus("Erro: " + Std.string(Reflect.field(result, "message")), 0xF38BA8);
+        }
+    }
+
+    function mtClearCreds() {
+        var result = runBridge("mt-clear-creds", {});
+        mtUser = ""; mtPass = "";
+        if (mtUserDisplay != null) mtUserDisplay.text = "";
+        if (mtPassDisplay != null) mtPassDisplay.text = "";
+        setMtStatus("Credenciais apagadas", 0xF9E2AF);
+    }
+
+    function maskPass(s:String):String {
+        var out = "";
+        for (i in 0...s.length) out += "*";
+        return out;
+    }
+
+    function setMtStatus(msg:String, color:Int) {
+        if (mtStatusText != null) { mtStatusText.text = msg; mtStatusText.textColor = color; }
+    }
+
+    function mtTestPorts() {
+        if (mtHost.length == 0) { setMtStatus("Host vazio", 0xF38BA8); return; }
+        setMtStatus("Testando " + mtHost + "...", 0xF9E2AF);
+        var ports = [22, 23, 80, 443, 2000, 8291, 8728, 8729, mtTelnetPort, mtWebfigPort, mtWinboxPort];
+        var result = runBridge("mt-test-ports", { host: mtHost, ports: ports });
+        if (result == null) { setMtStatus("Bridge falhou", 0xF38BA8); return; }
+        if (Reflect.field(result, "status") != "ok") {
+            setMtStatus("Erro: " + Std.string(Reflect.field(result, "message")), 0xF38BA8); return;
+        }
+        var data:Dynamic = Reflect.field(result, "data");
+        var portsD:Array<Dynamic> = cast Reflect.field(data, "ports");
+        mtResultsLayer.removeChildren();
+        var y:Float = 0;
+        var hdr = new Graphics(mtResultsLayer);
+        hdr.beginFill(0x45475A); hdr.drawRect(0, y, 400, 22); hdr.endFill();
+        addLayerText(mtResultsLayer, "Porta", 10, y + 3, 1.2, 0xCDD6F4);
+        addLayerText(mtResultsLayer, "Status", 120, y + 3, 1.2, 0xCDD6F4);
+        addLayerText(mtResultsLayer, "Servico", 240, y + 3, 1.2, 0xCDD6F4);
+        y += 24;
+        var labels = new Map<Int, String>();
+        labels.set(22, "SSH"); labels.set(23, "Telnet"); labels.set(80, "WebFig HTTP");
+        labels.set(443, "WebFig HTTPS"); labels.set(2000, "Bandwidth Test");
+        labels.set(8291, "WinBox"); labels.set(8728, "API"); labels.set(8729, "API-SSL");
+        labels.set(mtTelnetPort, "Telnet custom"); labels.set(mtWebfigPort, "WebFig custom"); labels.set(mtWinboxPort, "WinBox custom");
+        var openCount = 0;
+        for (i in 0...portsD.length) {
+            var r:Dynamic = portsD[i];
+            var p:Int = Reflect.field(r, "port");
+            var op:Bool = Reflect.field(r, "open") == true;
+            if (op) openCount++;
+            var rowColor:Int = (i % 2 == 0) ? 0x313244 : 0x1E1E2E;
+            var row = new Graphics(mtResultsLayer);
+            row.beginFill(rowColor); row.drawRect(0, y, 400, 22); row.endFill();
+            addLayerText(mtResultsLayer, Std.string(p), 10, y + 3, 1.1, 0xCDD6F4);
+            addLayerText(mtResultsLayer, op ? "ABERTA" : "fechada", 120, y + 3, 1.1, op ? 0xA6E3A1 : 0x6C7086);
+            var nm = labels.exists(p) ? labels.get(p) : "-";
+            addLayerText(mtResultsLayer, nm, 240, y + 3, 1.0, 0xA6ADC8);
+            y += 24;
+        }
+        setMtStatus(openCount + " portas abertas em " + mtHost, openCount > 0 ? 0xA6E3A1 : 0xF38BA8);
+    }
+
+    function mtOpenWinbox() {
+        if (mtHost.length == 0) { setMtStatus("Host vazio", 0xF38BA8); return; }
+        var useUser = mtUser.length > 0 ? mtUser : usernameStr;
+        var usePass = mtUser.length > 0 ? mtPass : passwordStr;
+        setMtStatus("Abrindo WinBox em " + mtHost + ":" + mtWinboxPort + " como " + useUser + "...", 0xF9E2AF);
+        var result = runBridge("mt-open-winbox", {
+            host: mtHost, port: mtWinboxPort,
+            username: useUser, password: usePass
+        });
+        if (result == null) { setMtStatus("Bridge falhou", 0xF38BA8); return; }
+        if (Reflect.field(result, "status") == "ok") {
+            var d:Dynamic = Reflect.field(result, "data");
+            setMtStatus("WinBox aberto: " + Std.string(Reflect.field(d, "target")), 0xA6E3A1);
+        } else {
+            setMtStatus(Std.string(Reflect.field(result, "message")), 0xF38BA8);
+        }
+    }
+
+    function mtOpenWebfig() {
+        if (mtHost.length == 0) { setMtStatus("Host vazio", 0xF38BA8); return; }
+        var result = runBridge("mt-open-webfig", { host: mtHost, port: mtWebfigPort });
+        if (result == null) { setMtStatus("Bridge falhou", 0xF38BA8); return; }
+        if (Reflect.field(result, "status") == "ok") {
+            var d:Dynamic = Reflect.field(result, "data");
+            setMtStatus("Navegador aberto: " + Std.string(Reflect.field(d, "opened")), 0xA6E3A1);
+        } else {
+            setMtStatus(Std.string(Reflect.field(result, "message")), 0xF38BA8);
+        }
+    }
+
+    function mtIdentify() {
+        if (mtHost.length == 0) { setMtStatus("Host vazio", 0xF38BA8); return; }
+        setMtStatus("Consultando " + mtHost + "...", 0xF9E2AF);
+        var result = runBridge("mt-identity", { host: mtHost, port: mtWebfigPort });
+        if (result == null) { setMtStatus("Bridge falhou", 0xF38BA8); return; }
+        if (Reflect.field(result, "status") == "ok") {
+            var d:Dynamic = Reflect.field(result, "data");
+            var srv = Std.string(Reflect.field(d, "server"));
+            var tit = Std.string(Reflect.field(d, "title"));
+            var st = Reflect.field(d, "status");
+            setMtStatus("HTTP " + Std.string(st) + " | Server=" + srv + " | Title=" + tit, 0xA6E3A1);
+        } else {
+            setMtStatus(Std.string(Reflect.field(result, "message")), 0xF38BA8);
+        }
+    }
+
+    function handleMtHostInput() {
+        for (k in 0...256) {
+            if (!Key.isPressed(k)) continue;
+            if (k == Key.ENTER) { mtEditingHost = false; drawFieldBox(mtHostBorder, 145, 46, 200, 22, false); mtTestPorts(); return; }
+            if (k == Key.ESCAPE) { mtEditingHost = false; drawFieldBox(mtHostBorder, 145, 46, 200, 22, false); return; }
+            if (k == Key.BACKSPACE) {
+                if (mtHost.length > 0) { mtHost = mtHost.substr(0, mtHost.length - 1); mtHostDisplay.text = mtHost; }
+                return;
+            }
+            if (k >= Key.A && k <= Key.Z) {
+                var c = k - Key.A + 97;
+                if (Key.isDown(Key.LSHIFT) || Key.isDown(Key.RSHIFT)) c -= 32;
+                mtHost += String.fromCharCode(c); mtHostDisplay.text = mtHost; return;
+            }
+            if (k >= Key.NUMBER_0 && k <= Key.NUMBER_9) {
+                mtHost += String.fromCharCode(k - Key.NUMBER_0 + 48); mtHostDisplay.text = mtHost; return;
+            }
+            if (k == 189 || k == Key.NUMPAD_SUB) { mtHost += "-"; mtHostDisplay.text = mtHost; return; }
+            if (k == 190 || k == Key.NUMPAD_DOT) { mtHost += "."; mtHostDisplay.text = mtHost; return; }
+        }
+    }
+
+    function mtTextChar(k:Int):String {
+        var shift = Key.isDown(Key.LSHIFT) || Key.isDown(Key.RSHIFT);
+        if (k >= Key.A && k <= Key.Z) {
+            var c = k - Key.A + 97; if (shift) c -= 32; return String.fromCharCode(c);
+        }
+        if (k >= Key.NUMBER_0 && k <= Key.NUMBER_9) {
+            if (shift) {
+                var syms = [")","!","@","#","$","%","^","&","*","("];
+                return syms[k - Key.NUMBER_0];
+            }
+            return String.fromCharCode(k - Key.NUMBER_0 + 48);
+        }
+        if (k >= Key.NUMPAD_0 && k <= Key.NUMPAD_9) return String.fromCharCode(k - Key.NUMPAD_0 + 48);
+        if (k == 189 || k == Key.NUMPAD_SUB) return shift ? "_" : "-";
+        if (k == 190 || k == Key.NUMPAD_DOT) return ".";
+        if (k == 191) return shift ? "?" : "/";
+        if (k == 186) return shift ? ":" : ";";
+        if (k == 187 || k == Key.NUMPAD_ADD) return shift ? "+" : "=";
+        if (k == 192) return shift ? "~" : "`";
+        if (k == 219) return shift ? "{" : "[";
+        if (k == 221) return shift ? "}" : "]";
+        if (k == 220) return shift ? "|" : "\\";
+        if (k == 222) return shift ? "\"" : "'";
+        if (k == 188) return shift ? "<" : ",";
+        if (k == Key.SPACE) return " ";
+        return null;
+    }
+
+    function handleMtUserInput() {
+        for (k in 0...256) {
+            if (!Key.isPressed(k)) continue;
+            if (k == Key.ENTER || k == Key.TAB) { mtEditingUser = false; drawFieldBox(mtUserBorder, 85, 100, 170, 22, false); return; }
+            if (k == Key.ESCAPE) { mtEditingUser = false; drawFieldBox(mtUserBorder, 85, 100, 170, 22, false); return; }
+            if (k == Key.BACKSPACE) {
+                if (mtUser.length > 0) { mtUser = mtUser.substr(0, mtUser.length - 1); mtUserDisplay.text = mtUser; }
+                return;
+            }
+            var ch = mtTextChar(k);
+            if (ch != null) { mtUser += ch; mtUserDisplay.text = mtUser; return; }
+        }
+    }
+
+    function handleMtPassInput() {
+        for (k in 0...256) {
+            if (!Key.isPressed(k)) continue;
+            if (k == Key.ENTER || k == Key.TAB) { mtEditingPass = false; drawFieldBox(mtPassBorder, 320, 100, 170, 22, false); return; }
+            if (k == Key.ESCAPE) { mtEditingPass = false; drawFieldBox(mtPassBorder, 320, 100, 170, 22, false); return; }
+            if (k == Key.BACKSPACE) {
+                if (mtPass.length > 0) { mtPass = mtPass.substr(0, mtPass.length - 1); mtPassDisplay.text = maskPass(mtPass); }
+                return;
+            }
+            var ch = mtTextChar(k);
+            if (ch != null) { mtPass += ch; mtPassDisplay.text = maskPass(mtPass); return; }
+        }
     }
 
     static function main() { new Main(); }

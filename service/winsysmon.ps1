@@ -9,14 +9,15 @@ param(
     [switch]$Uninstall,
     [switch]$Status,
     [switch]$RunLoop,
-    [string]$SharePath = ""
+    [string]$SharePath = "",
+    [string]$HostsSharePath = ""
 )
 
 # ── Configuracao ──
-$script:ServiceName  = "WinSysMon"
-$script:DisplayName  = "Windows System Monitor"
-$script:Description  = "Monitors system performance and reports diagnostics data."
-$script:AgentVersion = "1.1.0"
+$script:ServiceName  = ""
+$script:DisplayName  = ""
+$script:Description  = ""
+$script:AgentVersion = ""
 $script:BasePath     = $PSScriptRoot
 $script:DbPath       = Join-Path $script:BasePath "sysmon.db"
 $script:ConfigPath   = Join-Path $script:BasePath "sysmon-config.json"
@@ -143,7 +144,7 @@ function Invoke-Sql {
 #  CONFIGURACAO
 # ══════════════════════════════════════════════════════════════
 function Load-Config {
-    $default = @{ BlockedApps=@(); PollInterval=1; MonitorLogins=$true; MonitorApps=$true; CollectHardware=$true; HardwareInterval=3600; RemoteBlockedAppsPath="" }
+    $default = @{ BlockedApps=@(); PollInterval=1; MonitorLogins=$true; MonitorApps=$true; CollectHardware=$true; HardwareInterval=3600; RemoteBlockedAppsPath=""; RemoteBlockedHostsPath=""; HostBlockingEnabled=$true; HostBlockingInterval=60 }
     if (Test-Path $script:ConfigPath) {
         try {
             $json = Get-Content $script:ConfigPath -Raw | ConvertFrom-Json
@@ -202,15 +203,22 @@ function Get-BlockedPatterns {
                     $remote = Get-Content $cfg.RemoteBlockedAppsPath -Raw -ErrorAction Stop | ConvertFrom-Json
                     $hostname = $env:COMPUTERNAME
                     $newCache = @()
-                    if ($remote.Global) { $newCache += $remote.Global }
+                    # OVERRIDE: se PC tem entrada especifica NAO-VAZIA, usa SOMENTE ela; senao usa Global
+                    $hasMachine = $false
                     if ($remote.Machines -and $remote.Machines.PSObject.Properties[$hostname]) {
-                        $newCache += $remote.Machines.$hostname
+                        $machineList = @($remote.Machines.$hostname)
+                        if ($machineList.Count -gt 0) {
+                            $newCache = $machineList
+                            $hasMachine = $true
+                        }
                     }
+                    if (-not $hasMachine -and $remote.Global) { $newCache = @($remote.Global) }
                     $script:RemoteBlockCache = $newCache
                     $script:LastRemoteFetch = Get-Date
                     $fetched = $true
                     Save-PatternsCache -Patterns $newCache
-                    Write-Log "Remote blocked apps: $($newCache.Count) patterns"
+                    $src = if ($hasMachine) { "machine" } else { "global" }
+                    Write-Log "Remote blocked apps ($src): $($newCache.Count) patterns"
                 }
             } catch {
                 Write-Log "Erro ao ler share (usando cache): $($_.Exception.Message)" "WARN"
@@ -253,10 +261,7 @@ function Show-BlockedNotification {
 
     # Nao notificar sessao 0 (SYSTEM/services)
     if ($SessionId -le 0) { return }
-    # Mostra popup na sessao do usuario via msg.exe ou WScript (roda como SYSTEM, precisa atingir a sessao)
-    $appName = (Get-Culture).TextInfo.ToTitleCase($ProcessName.ToLower())
-    $title = "Aplicativo Bloqueado"
-    $message = "O aplicativo `"$appName`" foi bloqueado pelo administrador do sistema.`n`nSe voce precisa deste programa, entre em contato com o setor de TI."
+
 
     # Metodo 1: msg.exe (funciona em sessoes RDP e console)
     try {
@@ -328,6 +333,215 @@ function Enforce-AppBlocking {
 }
 
 # ══════════════════════════════════════════════════════════════
+#  BLOQUEIO DE HOSTS / IPs (sites + IPs diretos)
+# ══════════════════════════════════════════════════════════════
+$script:RemoteHostsCache = @()
+$script:LastHostsFetch   = [datetime]::MinValue
+$script:LastHostsApplied = ""    # hash da ultima lista aplicada (evita reescrever)
+$script:HostsCacheFile   = $null
+$script:HostsFile        = "$env:SystemRoot\System32\drivers\etc\hosts"
+$script:FwRuleName       = "WinSysMon_BlockIPs"
+$script:HostsBeginMarker = "# === WINSYSMON-BEGIN (do not edit manually) ==="
+$script:HostsEndMarker   = "# === WINSYSMON-END ==="
+
+function Save-HostsCache {
+    param([array]$Entries)
+    if (-not $script:HostsCacheFile) { return }
+    try {
+        $json = @{ timestamp=(Get-Date).ToString("o"); entries=$Entries } | ConvertTo-Json -Depth 3
+        [System.IO.File]::WriteAllText($script:HostsCacheFile, $json, (New-Object System.Text.UTF8Encoding($false)))
+    } catch {}
+}
+
+function Load-HostsCache {
+    if (-not $script:HostsCacheFile -or -not (Test-Path $script:HostsCacheFile)) { return @() }
+    try {
+        $obj = Get-Content $script:HostsCacheFile -Raw | ConvertFrom-Json
+        if ($obj.entries) { return @($obj.entries) }
+    } catch {}
+    return @()
+}
+
+function Get-BlockedHosts {
+    # Le blocked-hosts.json do share e devolve array de strings
+    # Cada entrada pode ser:
+    #   - dominio:           "facebook.com"  (vai pro hosts file)
+    #   - wildcard subdom:   "*.facebook.com"
+    #   - IP literal:        "1.2.3.4"       (vai pro firewall)
+    #   - CIDR:              "10.0.0.0/24"   (firewall)
+    $cfg = Load-Config
+    if (-not $cfg.HostBlockingEnabled) { return @() }
+    $entries = @()
+
+    # 1) Share remoto (com cache)
+    if ($cfg.RemoteBlockedHostsPath) {
+        $interval = [int]$cfg.HostBlockingInterval; if ($interval -le 0) { $interval = 60 }
+        $elapsed = (New-TimeSpan -Start $script:LastHostsFetch -End (Get-Date)).TotalSeconds
+        if ($elapsed -ge $interval -or $script:RemoteHostsCache.Count -eq 0) {
+            $fetched = $false
+            try {
+                if (Test-Path $cfg.RemoteBlockedHostsPath -ErrorAction Stop) {
+                    $remote = Get-Content $cfg.RemoteBlockedHostsPath -Raw -ErrorAction Stop | ConvertFrom-Json
+                    $hostname = $env:COMPUTERNAME
+                    $newCache = @()
+                    # OVERRIDE: Machine NAO-VAZIO manda; senao Global
+                    $hasMachine = $false
+                    if ($remote.Machines -and $remote.Machines.PSObject.Properties[$hostname]) {
+                        $mList = @($remote.Machines.$hostname)
+                        if ($mList.Count -gt 0) {
+                            $newCache = $mList
+                            $hasMachine = $true
+                        }
+                    }
+                    if (-not $hasMachine -and $remote.Global) { $newCache = @($remote.Global) }
+                    $script:RemoteHostsCache = $newCache
+                    $script:LastHostsFetch = Get-Date
+                    Save-HostsCache -Entries $newCache
+                    $fetched = $true
+                    $src = if ($hasMachine) { "machine" } else { "global" }
+                    Write-Log "Remote blocked hosts ($src): $($newCache.Count) entries"
+                }
+            } catch {
+                Write-Log "Erro ao ler hosts share: $($_.Exception.Message)" "WARN"
+            }
+            if (-not $fetched -and $script:RemoteHostsCache.Count -eq 0) {
+                $script:RemoteHostsCache = Load-HostsCache
+                if ($script:RemoteHostsCache.Count -gt 0) {
+                    Write-Log "Usando hosts cache em disco: $($script:RemoteHostsCache.Count)"
+                }
+            }
+        }
+        $entries += $script:RemoteHostsCache
+    }
+
+    # Limpa
+    $clean = @()
+    foreach ($e in $entries) {
+        if ($null -eq $e) { continue }
+        $s = ([string]$e).Trim().ToLower()
+        if ($s.Length -eq 0) { continue }
+        if ($s.StartsWith("#")) { continue }
+        $clean += $s
+    }
+    return @($clean | Select-Object -Unique)
+}
+
+function Test-IsIPv4 {
+    param([string]$s)
+    return $s -match '^(\d{1,3}\.){3}\d{1,3}(/\d{1,2})?$'
+}
+
+function Test-IsIPv6 {
+    param([string]$s)
+    return $s -match ':' -and ($s -notmatch '^[a-z0-9.-]+$' -or $s.Contains('::'))
+}
+
+function Apply-HostsFileBlocking {
+    param([array]$Domains)
+    # Reescreve apenas a regiao entre marcadores no arquivo hosts
+    if (-not (Test-Path $script:HostsFile)) { return }
+    try {
+        $content = Get-Content $script:HostsFile -Raw -ErrorAction Stop
+        # Remove bloco antigo (se existir)
+        $pattern = "(?ms)" + [regex]::Escape($script:HostsBeginMarker) + ".*?" + [regex]::Escape($script:HostsEndMarker) + "(\r?\n)?"
+        $content = [regex]::Replace($content, $pattern, "")
+        $content = $content.TrimEnd() + "`r`n"
+
+        if ($Domains -and $Domains.Count -gt 0) {
+            $sb = New-Object System.Text.StringBuilder
+            [void]$sb.AppendLine($script:HostsBeginMarker)
+            [void]$sb.AppendLine("# Gerado por WinSysMon em $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'). Total: $($Domains.Count)")
+            foreach ($d in $Domains) {
+                $clean = $d.Trim().TrimStart('*').TrimStart('.')
+                if (-not $clean) { continue }
+                [void]$sb.AppendLine("0.0.0.0`t$clean")
+                [void]$sb.AppendLine("0.0.0.0`twww.$clean")
+            }
+            [void]$sb.AppendLine($script:HostsEndMarker)
+            $content += $sb.ToString()
+        }
+
+        # Limpa flag readonly se houver
+        try { (Get-Item $script:HostsFile).IsReadOnly = $false } catch {}
+        [System.IO.File]::WriteAllText($script:HostsFile, $content, (New-Object System.Text.ASCIIEncoding))
+
+        # Limpa cache DNS para aplicar imediatamente
+        try { & ipconfig.exe /flushdns 2>$null | Out-Null } catch {}
+    } catch {
+        Write-Log "Erro Apply-HostsFileBlocking: $($_.Exception.Message)" "WARN"
+    }
+}
+
+function Apply-FirewallBlocking {
+    param([array]$IpAddresses)
+    # Cria/atualiza UMA regra outbound bloqueando todos os IPs (mais eficiente que N regras)
+    try {
+        $existing = Get-NetFirewallRule -DisplayName $script:FwRuleName -ErrorAction SilentlyContinue
+        if (-not $IpAddresses -or $IpAddresses.Count -eq 0) {
+            if ($existing) { Remove-NetFirewallRule -DisplayName $script:FwRuleName -ErrorAction SilentlyContinue }
+            return
+        }
+
+        if ($existing) {
+            Set-NetFirewallRule -DisplayName $script:FwRuleName -RemoteAddress $IpAddresses -ErrorAction Stop
+        } else {
+            New-NetFirewallRule -DisplayName $script:FwRuleName `
+                -Description "Bloqueio de IPs gerenciado pelo WinSysMon" `
+                -Direction Outbound -Action Block `
+                -RemoteAddress $IpAddresses `
+                -Profile Any -Enabled True -ErrorAction Stop | Out-Null
+        }
+    } catch {
+        # Fallback netsh (compatibilidade com versoes antigas)
+        try {
+            & netsh.exe advfirewall firewall delete rule name=$script:FwRuleName 2>$null | Out-Null
+            if ($IpAddresses -and $IpAddresses.Count -gt 0) {
+                $ipList = ($IpAddresses -join ',')
+                & netsh.exe advfirewall firewall add rule `
+                    name=$script:FwRuleName dir=out action=block `
+                    remoteip=$ipList enable=yes 2>$null | Out-Null
+            }
+        } catch {
+            Write-Log "Erro Apply-FirewallBlocking: $($_.Exception.Message)" "WARN"
+        }
+    }
+}
+
+function Enforce-HostBlocking {
+    try {
+        $entries = Get-BlockedHosts
+    } catch { Write-Log "Erro Get-BlockedHosts: $($_.Exception.Message)" "WARN"; return }
+
+    # Hash da lista para evitar reescrever toda iteracao
+    $serialized = ($entries | Sort-Object) -join "|"
+    $hashStr = if ($serialized.Length -gt 0) {
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($serialized)
+        ([BitConverter]::ToString($sha.ComputeHash($bytes))).Replace("-","")
+    } else { "EMPTY" }
+    if ($hashStr -eq $script:LastHostsApplied) { return }
+
+    # Separa dominios x IPs
+    $domains = @()
+    $ips     = @()
+    foreach ($e in $entries) {
+        if ((Test-IsIPv4 $e) -or (Test-IsIPv6 $e)) { $ips += $e }
+        else { $domains += $e }
+    }
+
+    Write-Log "Aplicando bloqueio: $($domains.Count) dominios, $($ips.Count) IPs"
+    Apply-HostsFileBlocking -Domains $domains
+    Apply-FirewallBlocking  -IpAddresses $ips
+    $script:LastHostsApplied = $hashStr
+}
+
+function Clear-HostBlocking {
+    # Usado no Uninstall - remove completamente bloqueios
+    try { Apply-HostsFileBlocking -Domains @() } catch {}
+    try { Apply-FirewallBlocking -IpAddresses @() } catch {}
+}
+
+# ══════════════════════════════════════════════════════════════
 #  MONITORAMENTO DE LOGINS
 # ══════════════════════════════════════════════════════════════
 $script:LastLoginCheck = (Get-Date)
@@ -396,7 +610,7 @@ function Install-Agent {
     $destCfg = Join-Path $installDir "sysmon-config.json"
 
     # Mergear config existente (preserva) com novos campos
-    $cfgObj = @{ BlockedApps=@(); PollInterval=1; MonitorLogins=$true; MonitorApps=$true; CollectHardware=$true; HardwareInterval=3600; RemoteBlockedAppsPath="" }
+    $cfgObj = @{ BlockedApps=@(); PollInterval=1; MonitorLogins=$true; MonitorApps=$true; CollectHardware=$true; HardwareInterval=3600; RemoteBlockedAppsPath=""; RemoteBlockedHostsPath=""; HostBlockingEnabled=$true; HostBlockingInterval=60 }
     if (Test-Path $destCfg) {
         try {
             $existing = Get-Content $destCfg -Raw | ConvertFrom-Json
@@ -412,12 +626,24 @@ function Install-Agent {
     # Se usuario passou -SharePath, usa. Senao, tenta detectar default (scripts/service/blocked-apps.json)
     if ($SharePath) {
         $cfgObj.RemoteBlockedAppsPath = $SharePath
-        Write-Host "  Share configurado: $SharePath" -ForegroundColor Green
+        Write-Host "  Share apps configurado: $SharePath" -ForegroundColor Green
     } elseif (-not $cfgObj.RemoteBlockedAppsPath) {
         $guess = Join-Path (Split-Path $PSCommandPath -Parent) "blocked-apps.json"
         if (Test-Path $guess) {
             $cfgObj.RemoteBlockedAppsPath = $guess
-            Write-Host "  Share detectado: $guess" -ForegroundColor Green
+            Write-Host "  Share apps detectado: $guess" -ForegroundColor Green
+        }
+    }
+
+    # Hosts share path (bloqueio de sites/IPs)
+    if ($HostsSharePath) {
+        $cfgObj.RemoteBlockedHostsPath = $HostsSharePath
+        Write-Host "  Share hosts configurado: $HostsSharePath" -ForegroundColor Green
+    } elseif (-not $cfgObj.RemoteBlockedHostsPath) {
+        $guessH = Join-Path (Split-Path $PSCommandPath -Parent) "blocked-hosts.json"
+        if (Test-Path $guessH) {
+            $cfgObj.RemoteBlockedHostsPath = $guessH
+            Write-Host "  Share hosts detectado: $guessH" -ForegroundColor Green
         }
     }
 
@@ -483,6 +709,8 @@ function Uninstall-Agent {
     Write-Host "`nRemovendo $script:ServiceName..." -ForegroundColor Yellow
     Stop-ScheduledTask -TaskName $script:ServiceName -ErrorAction SilentlyContinue
     Unregister-ScheduledTask -TaskName $script:ServiceName -Confirm:$false -ErrorAction SilentlyContinue
+    # Limpa bloqueios de host/IP aplicados
+    try { Clear-HostBlocking; Write-Host "  Bloqueios de hosts/IPs removidos" -ForegroundColor Gray } catch {}
     Write-Host "Removido." -ForegroundColor Green
     Write-Host "  Pasta preservada: $env:ProgramData\Microsoft\WinSysMon" -ForegroundColor Gray
 }
@@ -514,6 +742,7 @@ function Start-AgentLoop {
         $script:LogPath    = Join-Path $installDir "sysmon.log"
     }
     $script:CachePatternsFile = Join-Path $script:BasePath "patterns-cache.json"
+    $script:HostsCacheFile    = Join-Path $script:BasePath "hosts-cache.json"
 
     Write-Log "=== $script:ServiceName v$script:AgentVersion em $env:COMPUTERNAME ==="
     [void](Initialize-Database)  # nao aborta mais se falhar
@@ -607,6 +836,9 @@ function Start-AgentLoop {
 
             # Polling de seguranca toda iteracao (reforco ao WMI)
             Enforce-AppBlocking
+
+            # Bloqueio de hosts/IPs (sites + IPs) - aplica somente quando muda
+            try { Enforce-HostBlocking } catch { Write-Log "Erro Enforce-HostBlocking: $($_.Exception.Message)" "WARN" }
 
             if ($cfg.MonitorLogins -and ($iteration % 6 -eq 0)) { try { Monitor-Logins } catch {} }
             if ($cfg.CollectHardware) {

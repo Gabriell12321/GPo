@@ -84,6 +84,7 @@ Agente em PowerShell encapsulado em serviço Windows nativo (wrapper C# compilad
 | `service/winsysmon.ps1` | Loop principal: WMI watcher + polling + logs + notificações |
 | `service/install-service.ps1` | Compila o wrapper C# e registra o serviço |
 | `service/blocked-apps.json` | Lista central no share: Global + por máquina |
+| `service/blocked-hosts.json` | Lista de sites/IPs bloqueados: Global + por máquina |
 | `service/sysmon-config.json` | Config do agente (PollInterval, SharePath, etc.) |
 | `PARAGPOAA.BAT` | Script de Computer Startup da GPO (roda como SYSTEM) |
 | `INSTALAR.BAT` | Instalador manual com auto-elevação UAC |
@@ -104,6 +105,47 @@ Agente em PowerShell encapsulado em serviço Windows nativo (wrapper C# compilad
 ```
 
 Cada agente lê `Global + Machines[COMPUTERNAME]` e mata qualquer processo que dê match por nome, caminho ou wildcard.
+
+> **Semântica de override** (desde v1.2.0): se `Machines[COMPUTERNAME]` existir **e for não-vazio**, ele **substitui** a lista Global para aquele PC. Se for vazio ou ausente, o PC herda Global. Para remover o override via UI, use o botão **Usar Global**.
+
+### Bloqueio de Sites / IPs (v1.2.0)
+
+Mesmo modelo Global + por-máquina, em `service/blocked-hosts.json`:
+
+```json
+{
+    "Global": ["linkedin.com", "*.tiktok.com", "8.8.8.8", "10.0.0.0/24"],
+    "Machines": {
+        "PC-RECEPCAO": ["facebook.com", "instagram.com"]
+    }
+}
+```
+
+O agente aplica em duas camadas:
+
+- **Domínios** → escreve no `C:\Windows\System32\drivers\etc\hosts` apontando `0.0.0.0` entre marcadores `# WINSYSMON-BEGIN/END` (idempotente, preserva entradas existentes)
+- **IPs e CIDRs** (IPv4/IPv6) → cria uma única regra de firewall `WinSysMon_BlockIPs` (Outbound, Block, todos os perfis) com todos os IPs na lista `RemoteAddress`
+
+Config no `sysmon-config.json`:
+
+```json
+{
+    "RemoteBlockedHostsPath": "\\\\srv-105\\...\\service\\blocked-hosts.json",
+    "HostBlockingEnabled": true,
+    "HostBlockingInterval": 60
+}
+```
+
+Re-aplicação automática a cada 60s com detecção por hash — só reescreve `hosts`/firewall quando a lista muda. Na desinstalação, o `Clear-HostBlocking` remove ambos (bloco do hosts + regra de firewall).
+
+Formatos aceitos na UI:
+
+| Entrada | Tipo detectado | Ação |
+|---|---|---|
+| `facebook.com` | Site | hosts → `0.0.0.0 facebook.com` |
+| `*.tiktok.com` | Site wildcard | hosts (expande para padrões conhecidos) |
+| `8.8.8.8` | IP | firewall RemoteAddress |
+| `10.0.0.0/24` | CIDR | firewall RemoteAddress |
 
 ### Recursos de Robustez (v1.1.0)
 
@@ -153,6 +195,7 @@ Procure no `sysmon.log` por:
 
 - `WMI process watcher ativo` — detecção instantânea OK
 - `Remote blocked apps: N patterns` — leitura do share OK
+- `Host blocking: N entries (H hosts, I IPs)` — sites/IPs aplicados OK
 - `Heartbeat: iter=X wmi=True patterns=N` — vivo
 - `BLOQUEADO(WMI): nomedoapp PID=...` — bloqueios executados
 

@@ -157,11 +157,15 @@ try {
                 $json = Get-Content $sharePath -Raw | ConvertFrom-Json
                 $global = @()
                 $machine = @()
+                $hasMachine = $false
                 if ($json.Global) { $global = @($json.Global) }
                 if ($hostname -and $json.Machines -and $json.Machines.PSObject.Properties[$hostname]) {
                     $machine = @($json.Machines.$hostname)
+                    if ($machine.Count -gt 0) { $hasMachine = $true }
                 }
-                Write-Result "ok" @{ global = $global; machine = $machine; allApps = ($global + $machine) }
+                # Override: machine NAO-VAZIO manda; senao Global
+                $effective = if ($hasMachine) { $machine } else { $global }
+                Write-Result "ok" @{ global = $global; machine = $machine; allApps = $effective; hasMachine = $hasMachine }
             } catch {
                 Write-Result "error" -Message "Erro ao ler: $($_.Exception.Message)"
             }
@@ -187,12 +191,72 @@ try {
                     $json.Global = @($apps)
                 } elseif ($scope -eq "machine" -and $hostname) {
                     $json.Machines[$hostname] = @($apps)
+                } elseif ($scope -eq "clear" -and $hostname) {
+                    # Remove override do PC - passa a herdar Global
+                    if ($json.Machines.ContainsKey($hostname)) { [void]$json.Machines.Remove($hostname) }
                 }
                 $outJson = $json | ConvertTo-Json -Depth 5
                 [System.IO.File]::WriteAllText($sharePath, $outJson, (New-Object System.Text.UTF8Encoding($false)))
                 Write-Result "ok" @{ saved = $true }
             } catch {
                 Write-Result "error" -Message "Erro ao salvar: $($_.Exception.Message)"
+            }
+        }
+
+        "get-blocked-hosts" {
+            # Le blocked-hosts.json (mesmo formato do blocked-apps mas com dominios/IPs)
+            $sharePath = $args2.sharePath
+            $hostname  = $args2.hostname
+            try {
+                if (-not (Test-Path $sharePath)) {
+                    Write-Result "ok" @{ global = @(); machine = @(); allHosts = @() }
+                    return
+                }
+                $json = Get-Content $sharePath -Raw | ConvertFrom-Json
+                $global = @(); $machine = @(); $hasMachine = $false
+                if ($json.Global) { $global = @($json.Global) }
+                if ($hostname -and $json.Machines -and $json.Machines.PSObject.Properties[$hostname]) {
+                    $machine = @($json.Machines.$hostname)
+                    if ($machine.Count -gt 0) { $hasMachine = $true }
+                }
+                $effective = if ($hasMachine) { $machine } else { $global }
+                Write-Result "ok" @{ global = $global; machine = $machine; allHosts = $effective; hasMachine = $hasMachine }
+            } catch {
+                Write-Result "error" -Message "Erro ao ler hosts: $($_.Exception.Message)"
+            }
+        }
+
+        "save-blocked-hosts" {
+            $sharePath = $args2.sharePath
+            $hostname  = $args2.hostname
+            $hosts2    = $args2.hosts   # array de dominios/IPs
+            $scope     = $args2.scope   # "global" ou "machine"
+            try {
+                $json = @{ Global = @(); Machines = @{} }
+                if (Test-Path $sharePath) {
+                    $existing = Get-Content $sharePath -Raw | ConvertFrom-Json
+                    if ($existing.Global) { $json.Global = @($existing.Global) }
+                    if ($existing.Machines) {
+                        foreach ($prop in $existing.Machines.PSObject.Properties) {
+                            $json.Machines[$prop.Name] = @($prop.Value)
+                        }
+                    }
+                }
+                if ($scope -eq "global") {
+                    $json.Global = @($hosts2)
+                } elseif ($scope -eq "machine" -and $hostname) {
+                    $json.Machines[$hostname] = @($hosts2)
+                } elseif ($scope -eq "clear" -and $hostname) {
+                    if ($json.Machines.ContainsKey($hostname)) { [void]$json.Machines.Remove($hostname) }
+                }
+                $outJson = $json | ConvertTo-Json -Depth 5
+                # Garante diretorio
+                $dir = Split-Path $sharePath -Parent
+                if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+                [System.IO.File]::WriteAllText($sharePath, $outJson, (New-Object System.Text.UTF8Encoding($false)))
+                Write-Result "ok" @{ saved = $true }
+            } catch {
+                Write-Result "error" -Message "Erro ao salvar hosts: $($_.Exception.Message)"
             }
         }
 
@@ -711,6 +775,143 @@ try {
             } catch {
                 Write-Result "error" -Message "Erro: $($_.Exception.Message)"
             }
+        }
+
+        "mt-test-ports" {
+            # Testa portas TCP no MikroTik (ou qualquer host) sem bloquear a UI
+            $target = $args2.host
+            $portsArg = $args2.ports
+            if (-not $target) { Write-Result "error" -Message "host obrigatorio"; return }
+            if (-not $portsArg -or $portsArg.Count -eq 0) {
+                $portsArg = @(22,23,80,443,8291,8728,8729,18023,18080,18291)
+            }
+            $results = @()
+            foreach ($p in $portsArg) {
+                $c = New-Object System.Net.Sockets.TcpClient
+                $open = $false
+                try {
+                    $iar = $c.BeginConnect($target, [int]$p, $null, $null)
+                    if ($iar.AsyncWaitHandle.WaitOne(1500, $false) -and $c.Connected) {
+                        $c.EndConnect($iar); $open = $true
+                    }
+                } catch {} finally { $c.Close() }
+                $results += @{ port = [int]$p; open = [bool]$open }
+            }
+            Write-Result "ok" @{ host = $target; ports = $results }
+        }
+
+        "mt-open-winbox" {
+            # Tenta abrir WinBox apontando para host:port. Procura winbox.exe em caminhos comuns.
+            $target = $args2.host; $port = if ($args2.port) { [int]$args2.port } else { 8291 }
+            $mkUser = if ($args2.username) { [string]$args2.username } else { "" }
+            $mkPass = if ($args2.password) { [string]$args2.password } else { "" }
+            if (-not $target) { Write-Result "error" -Message "host obrigatorio"; return }
+            $candidates = @(
+                "C:\winbox\WinBox.exe",
+                "$env:ProgramFiles\Mikrotik\Winbox\winbox.exe",
+                "$env:ProgramFiles\WinBox\winbox.exe",
+                "${env:ProgramFiles(x86)}\Mikrotik\Winbox\winbox.exe",
+                "$env:LOCALAPPDATA\Mikrotik\Winbox\winbox.exe",
+                "$env:USERPROFILE\Downloads\winbox.exe",
+                "$env:USERPROFILE\Desktop\winbox.exe"
+            )
+            $exe = $candidates | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+            if (-not $exe) {
+                $which = Get-Command winbox.exe -ErrorAction SilentlyContinue
+                if ($which) { $exe = $which.Source }
+            }
+            if (-not $exe) {
+                Write-Result "error" -Message "winbox.exe nao encontrado. Baixe em https://mikrotik.com/download e coloque no Desktop ou instale."
+                return
+            }
+            try {
+                $argList = @("$target`:$port")
+                if ($mkUser) { $argList += $mkUser }
+                if ($mkUser -and $mkPass) { $argList += $mkPass }
+                Start-Process -FilePath $exe -ArgumentList $argList -ErrorAction Stop
+                Write-Result "ok" @{ launched = $exe; target = "$target`:$port"; user = $mkUser }
+            } catch {
+                Write-Result "error" -Message "Falha ao abrir winbox: $($_.Exception.Message)"
+            }
+        }
+
+        "mt-open-webfig" {
+            # Abre o WebFig no navegador padrao
+            $target = $args2.host; $port = if ($args2.port) { [int]$args2.port } else { 80 }
+            $scheme = if ($args2.https) { "https" } else { "http" }
+            if (-not $target) { Write-Result "error" -Message "host obrigatorio"; return }
+            $url = "$scheme`://$target`:$port"
+            try {
+                Start-Process $url -ErrorAction Stop
+                Write-Result "ok" @{ opened = $url }
+            } catch {
+                Write-Result "error" -Message "Falha ao abrir navegador: $($_.Exception.Message)"
+            }
+        }
+
+        "mt-identity" {
+            # Consulta identidade do MikroTik via HTTP (WebFig banner)
+            $target = $args2.host; $port = if ($args2.port) { [int]$args2.port } else { 80 }
+            if (-not $target) { Write-Result "error" -Message "host obrigatorio"; return }
+            try {
+                $resp = Invoke-WebRequest -Uri "http://$target`:$port" -UseBasicParsing -TimeoutSec 4 -MaximumRedirection 2 -ErrorAction Stop
+                $server = if ($resp.Headers.Server) { [string]$resp.Headers.Server } else { "" }
+                $title = ""
+                if ($resp.Content -match '<title>(.*?)</title>') { $title = $Matches[1] }
+                Write-Result "ok" @{ server = $server; title = $title; status = [int]$resp.StatusCode }
+            } catch {
+                $server = ""; $title = ""; $code = 0
+                if ($_.Exception.Response) {
+                    try { $code = [int]$_.Exception.Response.StatusCode } catch {}
+                    try { $server = [string]$_.Exception.Response.Headers.Server } catch {}
+                }
+                Write-Result "ok" @{ server = $server; title = $title; status = $code; note = $_.Exception.Message }
+            }
+        }
+
+        "mt-save-creds" {
+            # Salva user/pass MikroTik criptografado com DPAPI (so descriptografa pelo mesmo usuario Windows)
+            $mkUser = [string]$args2.username
+            $mkPass = [string]$args2.password
+            $host2  = [string]$args2.host
+            $file = Join-Path $env:APPDATA "gpo-app\mt-creds.xml"
+            $dir = Split-Path $file -Parent
+            if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+            try {
+                $sec = ConvertTo-SecureString $mkPass -AsPlainText -Force
+                $encPass = ConvertFrom-SecureString $sec   # DPAPI CurrentUser
+                $obj = [pscustomobject]@{
+                    host = $host2
+                    username = $mkUser
+                    passwordEnc = $encPass
+                    savedAt = (Get-Date).ToString('s')
+                }
+                $obj | Export-Clixml -Path $file -Force
+                Write-Result "ok" @{ saved = $true; path = $file }
+            } catch {
+                Write-Result "error" -Message "Falha ao salvar: $($_.Exception.Message)"
+            }
+        }
+
+        "mt-load-creds" {
+            $file = Join-Path $env:APPDATA "gpo-app\mt-creds.xml"
+            if (-not (Test-Path $file)) { Write-Result "ok" @{ found = $false }; return }
+            try {
+                $obj = Import-Clixml -Path $file
+                $sec = ConvertTo-SecureString $obj.passwordEnc
+                $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec)
+                $plain = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
+                [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+                Write-Result "ok" @{ found = $true; host = $obj.host; username = $obj.username; password = $plain }
+            } catch {
+                Write-Result "error" -Message "Falha ao carregar: $($_.Exception.Message)"
+            }
+        }
+
+        "mt-clear-creds" {
+            $file = Join-Path $env:APPDATA "gpo-app\mt-creds.xml"
+            if (Test-Path $file) { Remove-Item $file -Force -ErrorAction SilentlyContinue }
+            Write-Result "ok" @{ cleared = $true }
         }
 
         default {

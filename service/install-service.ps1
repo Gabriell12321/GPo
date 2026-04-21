@@ -7,7 +7,8 @@
 
 param(
     [switch]$Uninstall,
-    [string]$SharePath = "\\srv-105\Sistema de monitoramento\gpo\aaa\service\blocked-apps.json"
+    [string]$SharePath = "\\srv-105\Sistema de monitoramento\gpo\aaa\service\blocked-apps.json",
+    [string]$HostsSharePath = "\\srv-105\Sistema de monitoramento\gpo\aaa\service\blocked-hosts.json"
 )
 
 $ErrorActionPreference = "Stop"
@@ -95,13 +96,16 @@ try {
 
 # ---- Config (preserva existente, merge com SharePath atualizado) ----
 $defaultCfg = @{
-    BlockedApps           = @()
-    PollInterval          = 1
-    MonitorLogins         = $true
-    MonitorApps           = $true
-    CollectHardware       = $true
-    HardwareInterval      = 3600
-    RemoteBlockedAppsPath = $SharePath
+    BlockedApps             = @()
+    PollInterval            = 1
+    MonitorLogins           = $true
+    MonitorApps             = $true
+    CollectHardware         = $true
+    HardwareInterval        = 3600
+    RemoteBlockedAppsPath   = $SharePath
+    RemoteBlockedHostsPath  = $HostsSharePath
+    HostBlockingEnabled     = $true
+    HostBlockingInterval    = 60
 }
 $finalCfg = $defaultCfg.Clone()
 if (Test-Path $configPath) {
@@ -115,11 +119,12 @@ if (Test-Path $configPath) {
 }
 # Campos criticos sempre force defaults (evita configs antigas ruins)
 $finalCfg.PollInterval = 1
-if ($SharePath) { $finalCfg.RemoteBlockedAppsPath = $SharePath }
+if ($SharePath)      { $finalCfg.RemoteBlockedAppsPath  = $SharePath }
+if ($HostsSharePath) { $finalCfg.RemoteBlockedHostsPath = $HostsSharePath }
 try {
     $json = $finalCfg | ConvertTo-Json -Depth 5
     [System.IO.File]::WriteAllText($configPath, $json, (New-Object System.Text.UTF8Encoding($false)))
-    Write-InstallLog "Config salva: RemoteBlockedAppsPath=$($finalCfg.RemoteBlockedAppsPath) PollInterval=$($finalCfg.PollInterval)"
+    Write-InstallLog "Config salva: RemoteBlockedAppsPath=$($finalCfg.RemoteBlockedAppsPath) RemoteBlockedHostsPath=$($finalCfg.RemoteBlockedHostsPath) PollInterval=$($finalCfg.PollInterval)"
 } catch {
     Write-InstallLog "Falha ao salvar config: $($_.Exception.Message)" "ERROR"
     exit 1
