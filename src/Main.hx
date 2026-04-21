@@ -59,6 +59,32 @@ class Main extends hxd.App {
     var appStatusText:Text;
     var editingSearch:Bool = false;
 
+    // Hyper-V Manager
+    var hvHost:String = "";
+    var hvLayer:h2d.Object;
+    var hvScrollY:Float = 0;
+    var hvVms:Array<Dynamic> = [];
+    var hvStatusText:Text;
+    var hvHostDisplay:Text;
+    var hvHostBorder:Graphics;
+    var hvSelectedVM:Dynamic = null;
+    var hvSnapshots:Array<Dynamic> = [];
+    var hvSwitches:Array<Dynamic> = [];
+    var hvAutoRefreshTimer:Float = 0;
+    var hvEditingHost:Bool = false;
+    // Create-VM form
+    var hvFormFields:Map<String, String>;
+    var hvFormDisplays:Map<String, Text>;
+    var hvFormBorders:Map<String, Graphics>;
+    var hvFormActive:String = "";
+    var hvFormStatus:Text;
+    // Text input modal (snapshot name, VM name)
+    var modalActive:Bool = false;
+    var modalTitle:String = "";
+    var modalValue:String = "";
+    var modalDisplay:Text;
+    var modalCallback:String->Void;
+
     // All known Windows apps (process names)
     static var ALL_WINDOWS_APPS:Array<Array<String>> = [
         // [processName, displayName, category]
@@ -315,6 +341,9 @@ class Main extends hxd.App {
         editingSearch = false;
 
         drawHeader("Selecione o Computador");
+
+        // Botao Hyper-V
+        makeButton("Hyper-V", Std.int(W) - 190, 10, 80, 22, function() { showHyperV(); });
 
         // Busca
         var searchLabel = makeText("Buscar:", 1.3, 0xCDD6F4);
@@ -654,6 +683,528 @@ class Main extends hxd.App {
     }
 
     // ═══════════════════════════════════════
+    //  HYPER-V MANAGER
+    // ═══════════════════════════════════════
+    function setHvStatus(msg:String, color:Int) {
+        if (hvStatusText != null) { hvStatusText.text = msg; hvStatusText.textColor = color; }
+    }
+
+    function showHyperV() {
+        screen = "hyperv";
+        s2d.removeChildren();
+        hvScrollY = 0;
+        hvAutoRefreshTimer = 0;
+        hvEditingHost = false;
+        editingSearch = false;
+        modalActive = false;
+
+        drawHeader("Hyper-V Manager");
+        makeButton("< Voltar", 10, 46, 80, 22, function() { showComputerList(); });
+
+        // Host input
+        var lbl = makeText("Host:", 1.3, 0xCDD6F4); lbl.x = 100; lbl.y = 48;
+        hvHostBorder = new Graphics(s2d);
+        drawFieldBox(hvHostBorder, 145, 46, 200, 22, false);
+        hvHostDisplay = makeText(hvHost, 1.2, 0xFFFFFF);
+        hvHostDisplay.x = 150; hvHostDisplay.y = 48;
+        var hArea = new Interactive(200, 22, s2d);
+        hArea.x = 145; hArea.y = 46; hArea.cursor = Button;
+        hArea.onClick = function(_) {
+            hvEditingHost = true;
+            drawFieldBox(hvHostBorder, 145, 46, 200, 22, true);
+        };
+
+        makeButton("Conectar", 355, 46, 90, 22, function() {
+            hvEditingHost = false;
+            drawFieldBox(hvHostBorder, 145, 46, 200, 22, false);
+            loadVMs();
+        });
+        makeButton("Atualizar", 455, 46, 90, 22, function() { loadVMs(); });
+        makeButton("Nova VM", 555, 46, 90, 22, function() {
+            if (hvHost.length == 0) { setHvStatus("Informe o host primeiro", 0xF9E2AF); return; }
+            showCreateVMForm();
+        });
+
+        hvStatusText = makeText(hvHost.length == 0 ? "Informe o host Hyper-V e clique Conectar" : "Pronto", 1.2, 0xF9E2AF);
+        hvStatusText.x = 10; hvStatusText.y = 76;
+
+        hvLayer = new h2d.Object(s2d);
+        hvLayer.x = 10; hvLayer.y = 100;
+
+        if (hvHost.length > 0 && hvVms.length > 0) {
+            renderVMList();
+        }
+    }
+
+    function loadVMs() {
+        if (hvHost.length == 0) { setHvStatus("Host vazio", 0xF38BA8); return; }
+        setHvStatus("Listando VMs em " + hvHost + "...", 0xF9E2AF);
+        var result = runBridge("hv-list-vms", {
+            hvHost: hvHost, username: usernameStr, password: passwordStr, domain: DOMAIN
+        });
+        if (result == null) { setHvStatus("Bridge falhou", 0xF38BA8); return; }
+        var status:String = Reflect.field(result, "status");
+        if (status != "ok") {
+            setHvStatus("Erro: " + Std.string(Reflect.field(result, "message")), 0xF38BA8);
+            return;
+        }
+        var data:Dynamic = Reflect.field(result, "data");
+        var vmsD:Dynamic = Reflect.field(data, "vms");
+        if (vmsD != null && Std.isOfType(vmsD, Array)) {
+            hvVms = cast vmsD;
+            setHvStatus(hvVms.length + " VMs encontradas em " + hvHost + " (auto-refresh 3s)", 0xA6E3A1);
+            renderVMList();
+        } else {
+            hvVms = [];
+            setHvStatus("Nenhuma VM", 0xF9E2AF);
+            renderVMList();
+        }
+    }
+
+    function stateColor(state:String):Int {
+        return switch (state) {
+            case "Running": 0xA6E3A1;
+            case "Off": 0x6C7086;
+            case "Paused" | "Saved": 0xF9E2AF;
+            case "Starting" | "Stopping" | "Saving" | "Pausing" | "Resuming": 0x89DCEB;
+            default: 0xA6ADC8;
+        }
+    }
+
+    function renderVMList() {
+        if (hvLayer == null) return;
+        hvLayer.removeChildren();
+        var y:Float = 0;
+        var w = W - 20;
+
+        // Header
+        var hdr = new Graphics(hvLayer);
+        hdr.beginFill(0x45475A); hdr.drawRect(0, y, w, 22); hdr.endFill();
+        addLayerText(hvLayer, "VM", 10, y + 3, 1.2, 0xCDD6F4);
+        addLayerText(hvLayer, "Estado", 180, y + 3, 1.2, 0xCDD6F4);
+        addLayerText(hvLayer, "CPU%", 270, y + 3, 1.2, 0xCDD6F4);
+        addLayerText(hvLayer, "RAM (MB)", 320, y + 3, 1.2, 0xCDD6F4);
+        addLayerText(hvLayer, "Uptime", 420, y + 3, 1.2, 0xCDD6F4);
+        addLayerText(hvLayer, "Acoes", 520, y + 3, 1.2, 0xCDD6F4);
+        y += 24;
+
+        for (i in 0...hvVms.length) {
+            var vm:Dynamic = hvVms[i];
+            var name:String = Std.string(Reflect.field(vm, "name"));
+            var state:String = Std.string(Reflect.field(vm, "state"));
+            var cpu:Int = Reflect.field(vm, "cpuUsage");
+            var memA:Int = Reflect.field(vm, "memAssigned");
+            var memD:Int = Reflect.field(vm, "memDemand");
+            var uptime:String = Std.string(Reflect.field(vm, "uptime"));
+
+            var rowColor:Int = (i % 2 == 0) ? 0x313244 : 0x1E1E2E;
+            var row = new Graphics(hvLayer);
+            row.beginFill(rowColor); row.drawRect(0, y, w, 28); row.endFill();
+
+            addLayerText(hvLayer, name, 10, y + 6, 1.1, 0x89B4FA);
+            addLayerText(hvLayer, state, 180, y + 6, 1.0, stateColor(state));
+            addLayerText(hvLayer, Std.string(cpu) + "%", 270, y + 6, 1.0, 0xCDD6F4);
+            var memStr = Std.string(memA);
+            if (memD > 0 && memD != memA) memStr += "/" + Std.string(memD);
+            addLayerText(hvLayer, memStr, 320, y + 6, 1.0, 0xCDD6F4);
+            addLayerText(hvLayer, uptime, 420, y + 6, 0.9, 0x6C7086);
+
+            // Action buttons inline
+            var bx:Float = 520;
+            var isOff = (state == "Off" || state == "Saved" || state == "Paused");
+            var vmRef = vm;
+            var nRef = name;
+
+            // Start / Resume
+            if (isOff) {
+                makeLayerButton(hvLayer, "Start", bx, y + 4, 55, 20, 0xA6E3A1, function() { vmAction(nRef, "start"); });
+            } else {
+                makeLayerButton(hvLayer, "Pause", bx, y + 4, 55, 20, 0xF9E2AF, function() { vmAction(nRef, "save"); });
+            }
+            bx += 60;
+            makeLayerButton(hvLayer, "Stop", bx, y + 4, 50, 20, 0xF38BA8, function() { vmAction(nRef, "shutdown"); });
+            bx += 55;
+            makeLayerButton(hvLayer, "Off!", bx, y + 4, 45, 20, 0xEB6F92, function() { vmAction(nRef, "stop"); });
+            bx += 50;
+            makeLayerButton(hvLayer, "Snap", bx, y + 4, 50, 20, 0xCBA6F7, function() {
+                hvSelectedVM = vmRef;
+                openTextModal("Nome do snapshot (Enter p/ confirmar)", "", function(nm) {
+                    createSnapshot(nRef, nm);
+                });
+            });
+            bx += 55;
+            makeLayerButton(hvLayer, "Detalhes", bx, y + 4, 75, 20, 0x89DCEB, function() {
+                hvSelectedVM = vmRef; showVMDetails();
+            });
+            bx += 80;
+            makeLayerButton(hvLayer, "Del", bx, y + 4, 40, 20, 0xF38BA8, function() {
+                hvSelectedVM = vmRef;
+                openTextModal("Digite DELETE para confirmar remocao de '" + nRef + "'", "", function(v) {
+                    if (v == "DELETE") { deleteVM(nRef, false); }
+                    else setHvStatus("Remocao cancelada", 0xF9E2AF);
+                });
+            });
+
+            y += 30;
+        }
+    }
+
+    function vmAction(vmName:String, act:String) {
+        setHvStatus("Executando '" + act + "' em " + vmName + "...", 0xF9E2AF);
+        var result = runBridge("hv-vm-action", {
+            hvHost: hvHost, vmName: vmName, action: act,
+            username: usernameStr, password: passwordStr, domain: DOMAIN
+        });
+        if (result != null && Reflect.field(result, "status") == "ok") {
+            setHvStatus("OK: " + vmName + " -> " + act, 0xA6E3A1);
+            hvAutoRefreshTimer = 1.5;
+        } else {
+            var msg = result != null ? Std.string(Reflect.field(result, "message")) : "bridge falhou";
+            setHvStatus("Erro: " + msg, 0xF38BA8);
+        }
+    }
+
+    function createSnapshot(vmName:String, snapName:String) {
+        setHvStatus("Criando snapshot de " + vmName + "...", 0xF9E2AF);
+        var result = runBridge("hv-snapshot-action", {
+            hvHost: hvHost, vmName: vmName, action: "create", newName: snapName,
+            username: usernameStr, password: passwordStr, domain: DOMAIN
+        });
+        if (result != null && Reflect.field(result, "status") == "ok") {
+            var data:Dynamic = Reflect.field(result, "data");
+            setHvStatus("Snapshot criado: " + Std.string(Reflect.field(data, "created")), 0xA6E3A1);
+        } else {
+            var msg = result != null ? Std.string(Reflect.field(result, "message")) : "bridge falhou";
+            setHvStatus("Erro: " + msg, 0xF38BA8);
+        }
+    }
+
+    function deleteVM(vmName:String, delVhd:Bool) {
+        setHvStatus("Removendo VM " + vmName + "...", 0xF9E2AF);
+        var result = runBridge("hv-delete-vm", {
+            hvHost: hvHost, vmName: vmName, deleteVhd: delVhd,
+            username: usernameStr, password: passwordStr, domain: DOMAIN
+        });
+        if (result != null && Reflect.field(result, "status") == "ok") {
+            setHvStatus("VM removida: " + vmName, 0xA6E3A1);
+            loadVMs();
+        } else {
+            var msg = result != null ? Std.string(Reflect.field(result, "message")) : "bridge falhou";
+            setHvStatus("Erro: " + msg, 0xF38BA8);
+        }
+    }
+
+    // ═════════════ DETALHES + SNAPSHOTS ═════════════
+    function showVMDetails() {
+        screen = "hyperv-details";
+        s2d.removeChildren();
+        hvAutoRefreshTimer = 0;
+        modalActive = false;
+
+        var name:String = Std.string(Reflect.field(hvSelectedVM, "name"));
+        drawHeader("VM: " + name);
+        makeButton("< Voltar", 10, 46, 80, 22, function() { showHyperV(); });
+        makeButton("Atualizar", 100, 46, 90, 22, function() { showVMDetails(); });
+        makeButton("Novo Snapshot", 200, 46, 120, 22, function() {
+            openTextModal("Nome do snapshot", "", function(nm) {
+                createSnapshot(name, nm);
+                haxe.Timer.delay(function() { showVMDetails(); }, 800);
+            });
+        });
+
+        hvStatusText = makeText("Carregando stats...", 1.2, 0xF9E2AF);
+        hvStatusText.x = 10; hvStatusText.y = 76;
+
+        // Stats box
+        var statsResult = runBridge("hv-vm-stats", {
+            hvHost: hvHost, vmName: name,
+            username: usernameStr, password: passwordStr, domain: DOMAIN
+        });
+        if (statsResult != null && Reflect.field(statsResult, "status") == "ok") {
+            var s:Dynamic = Reflect.field(statsResult, "data");
+            var y:Float = 100;
+            var box = new Graphics(s2d);
+            box.beginFill(0x313244); box.drawRect(10, y, W - 20, 150); box.endFill();
+            var col1x:Float = 20; var col2x:Float = 250; var col3x:Float = 500;
+            var ry = y + 10;
+            var state:String = Std.string(Reflect.field(s, "state"));
+            addFieldLine(col1x, ry, "Estado:", state, stateColor(state));
+            addFieldLine(col1x, ry + 22, "CPU:", Std.string(Reflect.field(s, "cpuUsage")) + "%", 0xF9E2AF);
+            addFieldLine(col1x, ry + 44, "Processadores:", Std.string(Reflect.field(s, "processors")), 0xCDD6F4);
+            addFieldLine(col1x, ry + 66, "Geracao:", Std.string(Reflect.field(s, "generation")), 0xCDD6F4);
+            addFieldLine(col1x, ry + 88, "Uptime:", Std.string(Reflect.field(s, "uptime")), 0x89DCEB);
+
+            addFieldLine(col2x, ry, "RAM Atribuida:", Std.string(Reflect.field(s, "memAssigned")) + " MB", 0xA6E3A1);
+            addFieldLine(col2x, ry + 22, "RAM Demanda:", Std.string(Reflect.field(s, "memDemand")) + " MB", 0xA6E3A1);
+            addFieldLine(col2x, ry + 44, "RAM Inicial:", Std.string(Reflect.field(s, "memStartup")) + " MB", 0xCDD6F4);
+            addFieldLine(col2x, ry + 66, "RAM Min:", Std.string(Reflect.field(s, "memMinimum")) + " MB", 0xCDD6F4);
+            addFieldLine(col2x, ry + 88, "RAM Max:", Std.string(Reflect.field(s, "memMaximum")) + " MB", 0xCDD6F4);
+
+            addFieldLine(col3x, ry, "VHD Tam:", Std.string(Reflect.field(s, "vhdSizeGB")) + " GB", 0xCBA6F7);
+            addFieldLine(col3x, ry + 22, "VHD Usado:", Std.string(Reflect.field(s, "vhdUsedGB")) + " GB", 0xCBA6F7);
+            addFieldLine(col3x, ry + 44, "Switch:", Std.string(Reflect.field(s, "switchName")), 0x89B4FA);
+            addFieldLine(col3x, ry + 66, "MAC:", Std.string(Reflect.field(s, "macAddress")), 0x6C7086);
+            addFieldLine(col3x, ry + 88, "IPs:", Std.string(Reflect.field(s, "ipAddresses")), 0x6C7086);
+
+            setHvStatus("Stats atualizados", 0xA6E3A1);
+        } else {
+            setHvStatus("Erro ao obter stats", 0xF38BA8);
+        }
+
+        // Snapshots list
+        var snapResult = runBridge("hv-list-snapshots", {
+            hvHost: hvHost, vmName: name,
+            username: usernameStr, password: passwordStr, domain: DOMAIN
+        });
+        var y2:Float = 260;
+        addLayerText(s2d, "═══ Snapshots ═══", 10, y2, 1.3, 0xCBA6F7);
+        y2 += 25;
+
+        if (snapResult != null && Reflect.field(snapResult, "status") == "ok") {
+            var data:Dynamic = Reflect.field(snapResult, "data");
+            var snapsD:Dynamic = Reflect.field(data, "snapshots");
+            if (snapsD != null && Std.isOfType(snapsD, Array)) {
+                hvSnapshots = cast snapsD;
+                if (hvSnapshots.length == 0) {
+                    addLayerText(s2d, "Sem snapshots", 10, y2, 1.1, 0x6C7086);
+                } else {
+                    var hdr = new Graphics(s2d);
+                    hdr.beginFill(0x45475A); hdr.drawRect(10, y2, W - 20, 22); hdr.endFill();
+                    addLayerText(s2d, "Nome", 20, y2 + 3, 1.1, 0xCDD6F4);
+                    addLayerText(s2d, "Criado", 280, y2 + 3, 1.1, 0xCDD6F4);
+                    addLayerText(s2d, "Parent", 450, y2 + 3, 1.1, 0xCDD6F4);
+                    addLayerText(s2d, "Acoes", W - 200, y2 + 3, 1.1, 0xCDD6F4);
+                    y2 += 24;
+                    for (i in 0...hvSnapshots.length) {
+                        var sn:Dynamic = hvSnapshots[i];
+                        var snm:String = Std.string(Reflect.field(sn, "name"));
+                        var rc:Int = (i % 2 == 0) ? 0x313244 : 0x1E1E2E;
+                        var r = new Graphics(s2d);
+                        r.beginFill(rc); r.drawRect(10, y2, W - 20, 22); r.endFill();
+                        addLayerText(s2d, snm, 20, y2 + 3, 1.0, 0x89B4FA);
+                        addLayerText(s2d, Std.string(Reflect.field(sn, "created")), 280, y2 + 3, 0.95, 0xA6ADC8);
+                        addLayerText(s2d, Std.string(Reflect.field(sn, "parent")), 450, y2 + 3, 0.95, 0x6C7086);
+                        var snRef = snm;
+                        makeButton("Restaurar", W - 195, y2 + 1, 85, 20, function() {
+                            snapshotAction(name, snRef, "restore");
+                        });
+                        makeButton("Remover", W - 105, y2 + 1, 80, 20, function() {
+                            snapshotAction(name, snRef, "delete");
+                        });
+                        y2 += 22;
+                    }
+                }
+            }
+        } else {
+            addLayerText(s2d, "Erro ao listar snapshots", 10, y2, 1.1, 0xF38BA8);
+        }
+    }
+
+    function addFieldLine(x:Float, y:Float, lbl:String, val:String, color:Int) {
+        var t1 = makeText(lbl, 1.1, 0xA6ADC8); t1.x = x; t1.y = y;
+        var t2 = makeText(val, 1.1, color); t2.x = x + 115; t2.y = y;
+    }
+
+    function snapshotAction(vmName:String, snapName:String, act:String) {
+        setHvStatus(act + " " + snapName + "...", 0xF9E2AF);
+        var result = runBridge("hv-snapshot-action", {
+            hvHost: hvHost, vmName: vmName, snapshotName: snapName, action: act,
+            username: usernameStr, password: passwordStr, domain: DOMAIN
+        });
+        if (result != null && Reflect.field(result, "status") == "ok") {
+            setHvStatus("OK: " + act + " " + snapName, 0xA6E3A1);
+            haxe.Timer.delay(function() { showVMDetails(); }, 500);
+        } else {
+            var msg = result != null ? Std.string(Reflect.field(result, "message")) : "bridge falhou";
+            setHvStatus("Erro: " + msg, 0xF38BA8);
+        }
+    }
+
+    // ═════════════ CRIAR VM ═════════════
+    function showCreateVMForm() {
+        screen = "hyperv-create";
+        s2d.removeChildren();
+        modalActive = false;
+
+        // Inicializar apenas se campos ainda nao existem (preservar edicao)
+        if (hvFormFields == null) {
+            hvFormFields = new Map();
+            hvFormFields.set("name", "NovaVM");
+            hvFormFields.set("memoryMB", "2048");
+            hvFormFields.set("vhdSizeGB", "40");
+            hvFormFields.set("processors", "2");
+            hvFormFields.set("generation", "2");
+            hvFormFields.set("switchName", "");
+            hvFormActive = "name";
+        }
+        hvFormDisplays = new Map();
+        hvFormBorders = new Map();
+
+        drawHeader("Criar VM em " + hvHost);
+        makeButton("< Voltar", 10, 46, 80, 22, function() {
+            hvFormFields = null; // reset form ao sair
+            showHyperV();
+        });
+
+        // Carregar switches apenas se ainda nao carregou
+        var firstSw = "";
+        if (hvSwitches == null || hvSwitches.length == 0) {
+            var swRes = runBridge("hv-list-switches", {
+                hvHost: hvHost, username: usernameStr, password: passwordStr, domain: DOMAIN
+            });
+            if (swRes != null && Reflect.field(swRes, "status") == "ok") {
+                var d:Dynamic = Reflect.field(swRes, "data");
+                var swD:Dynamic = Reflect.field(d, "switches");
+                if (swD != null && Std.isOfType(swD, Array)) {
+                    hvSwitches = cast swD;
+                }
+            }
+        }
+        if (hvSwitches != null && hvSwitches.length > 0) {
+            firstSw = Std.string(Reflect.field(hvSwitches[0], "name"));
+            if (hvFormFields.get("switchName") == "") hvFormFields.set("switchName", firstSw);
+        }
+
+        var startY:Float = 90;
+        var lh:Float = 42;
+        var fields:Array<Array<String>> = [
+            ["name", "Nome da VM"],
+            ["memoryMB", "Memoria RAM (MB)"],
+            ["vhdSizeGB", "Disco VHDX (GB)"],
+            ["processors", "Processadores"],
+            ["generation", "Geracao (1 ou 2)"],
+            ["switchName", "Virtual Switch" + (hvSwitches != null && hvSwitches.length > 0 ? " (sugerido: " + firstSw + ")" : "")]
+        ];
+
+        for (i in 0...fields.length) {
+            var fKey = fields[i][0];
+            var fLbl = fields[i][1];
+            var fy = startY + i * lh;
+            var lblT = makeText(fLbl + ":", 1.2, 0xCDD6F4); lblT.x = 20; lblT.y = fy + 4;
+            var bord = new Graphics(s2d);
+            drawFieldBox(bord, 240, fy, 300, 24, fKey == hvFormActive);
+            var disp = makeText(hvFormFields.get(fKey), 1.2, 0xFFFFFF);
+            disp.x = 245; disp.y = fy + 4;
+            hvFormDisplays.set(fKey, disp);
+            hvFormBorders.set(fKey, bord);
+            var ia = new Interactive(300, 24, s2d);
+            ia.x = 240; ia.y = fy; ia.cursor = Button;
+            var kRef = fKey;
+            ia.onClick = function(_) { setFormActive(kRef); };
+        }
+
+        // Lista de switches disponiveis
+        if (hvSwitches != null && hvSwitches.length > 0) {
+            var sy = startY + fields.length * lh + 10;
+            addLayerText(s2d, "Switches disponiveis:", 20, sy, 1.1, 0xA6ADC8);
+            var names:Array<String> = [];
+            for (sw in hvSwitches) names.push(Std.string(Reflect.field(sw, "name")));
+            addLayerText(s2d, names.join(", "), 180, sy, 1.0, 0x6C7086);
+        }
+
+        makeButton("Criar VM", 240, startY + fields.length * lh + 40, 150, 30, function() { submitCreateVM(); });
+        makeButton("Cancelar", 400, startY + fields.length * lh + 40, 140, 30, function() { showHyperV(); });
+
+        hvFormStatus = makeText("", 1.2, 0xA6E3A1);
+        hvFormStatus.x = 20; hvFormStatus.y = startY + fields.length * lh + 85;
+    }
+
+    function setFormActive(k:String) {
+        hvFormActive = k;
+        // Rebuild para atualizar highlight do campo
+        showCreateVMForm();
+    }
+
+    function submitCreateVM() {
+        var nm = hvFormFields.get("name");
+        if (nm == null || nm.length == 0) { hvFormStatus.text = "Nome obrigatorio"; hvFormStatus.textColor = 0xF38BA8; return; }
+        var memMB = Std.parseInt(hvFormFields.get("memoryMB"));
+        var sizeGB = Std.parseInt(hvFormFields.get("vhdSizeGB"));
+        var procs = Std.parseInt(hvFormFields.get("processors"));
+        var gen = Std.parseInt(hvFormFields.get("generation"));
+        if (memMB == null || memMB < 256) { hvFormStatus.text = "RAM minima 256 MB"; hvFormStatus.textColor = 0xF38BA8; return; }
+        if (sizeGB == null || sizeGB < 1) { hvFormStatus.text = "Disco minimo 1 GB"; hvFormStatus.textColor = 0xF38BA8; return; }
+        if (gen != 1 && gen != 2) { hvFormStatus.text = "Geracao deve ser 1 ou 2"; hvFormStatus.textColor = 0xF38BA8; return; }
+
+        hvFormStatus.text = "Criando VM " + nm + "...";
+        hvFormStatus.textColor = 0xF9E2AF;
+
+        var result = runBridge("hv-create-vm", {
+            hvHost: hvHost, vmName: nm, memoryMB: memMB, vhdSizeGB: sizeGB,
+            processors: procs, generation: gen, switchName: hvFormFields.get("switchName"),
+            username: usernameStr, password: passwordStr, domain: DOMAIN
+        });
+        if (result != null && Reflect.field(result, "status") == "ok") {
+            hvFormStatus.text = "VM criada: " + nm + ". Voltando...";
+            hvFormStatus.textColor = 0xA6E3A1;
+            haxe.Timer.delay(function() { loadVMs(); showHyperV(); }, 1500);
+        } else {
+            var msg = result != null ? Std.string(Reflect.field(result, "message")) : "bridge falhou";
+            hvFormStatus.text = "Erro: " + msg;
+            hvFormStatus.textColor = 0xF38BA8;
+        }
+    }
+
+    // ═════════════ MODAL DE TEXTO ═════════════
+    function openTextModal(title:String, initial:String, cb:String->Void) {
+        modalActive = true;
+        modalTitle = title;
+        modalValue = initial;
+        modalCallback = cb;
+
+        // Draw overlay
+        var overlay = new Graphics(s2d);
+        overlay.beginFill(0x000000, 0.7); overlay.drawRect(0, 0, W, H); overlay.endFill();
+        overlay.name = "modalOverlay";
+
+        var mw:Float = 500; var mh:Float = 140;
+        var mx:Float = (W - mw) / 2; var my:Float = (H - mh) / 2;
+        var box = new Graphics(s2d);
+        box.beginFill(0x313244); box.drawRect(mx, my, mw, mh); box.endFill();
+        box.lineStyle(2, 0x89B4FA);
+        box.drawRect(mx, my, mw, mh);
+        box.name = "modalOverlay";
+
+        var ttl = makeText(title, 1.2, 0xCDD6F4); ttl.x = mx + 15; ttl.y = my + 12;
+        ttl.name = "modalOverlay";
+
+        var bord = new Graphics(s2d);
+        drawFieldBox(bord, mx + 15, my + 55, mw - 30, 28, true);
+        bord.name = "modalOverlay";
+
+        modalDisplay = makeText(initial, 1.3, 0xFFFFFF);
+        modalDisplay.x = mx + 20; modalDisplay.y = my + 58;
+        modalDisplay.name = "modalOverlay";
+
+        var hint = makeText("ENTER=OK   ESC=Cancelar", 1.0, 0x6C7086);
+        hint.x = mx + 15; hint.y = my + 110;
+        hint.name = "modalOverlay";
+    }
+
+    function closeModal() {
+        modalActive = false;
+        // remove overlay children by name
+        var i = s2d.numChildren - 1;
+        while (i >= 0) {
+            var c = s2d.getChildAt(i);
+            if (c.name == "modalOverlay") s2d.removeChild(c);
+            i--;
+        }
+    }
+
+    function makeLayerButton(layer:h2d.Object, label:String, x:Float, y:Float, w:Float, h:Float, color:Int, onClick:Void->Void) {
+        var bg = new Graphics(layer);
+        bg.beginFill(color); bg.drawRect(x, y, w, h); bg.endFill();
+        var t = new Text(font, layer); t.text = label; t.setScale(0.95); t.textColor = 0x1E1E2E;
+        t.x = x + (w - t.textWidth * 0.95) / 2; t.y = y + 3;
+        var ia = new Interactive(w, h, layer);
+        ia.x = x; ia.y = y; ia.cursor = Button;
+        ia.onClick = function(_) { onClick(); };
+        ia.onOver = function(_) { bg.clear(); bg.beginFill(0xF5C2E7); bg.drawRect(x, y, w, h); bg.endFill(); };
+        ia.onOut = function(_) { bg.clear(); bg.beginFill(color); bg.drawRect(x, y, w, h); bg.endFill(); };
+    }
+
+    // ═══════════════════════════════════════
     //  BRIDGE POWERSHELL
     // ═══════════════════════════════════════
     function runBridge(cmd:String, args:Dynamic):Dynamic {
@@ -727,6 +1278,10 @@ class Main extends hxd.App {
     //  INPUT
     // ═══════════════════════════════════════
     override function update(dt:Float) {
+        if (modalActive) {
+            handleModalInput();
+            return;
+        }
         if (screen == "login") {
             handleLoginInput();
         } else if (screen == "computers") {
@@ -735,6 +1290,141 @@ class Main extends hxd.App {
         } else if (screen == "apps") {
             handleScroll(appLayer, appScrollY, 76);
             handleSearchInput(function(s) { appSearchStr = s; appSearchDisplay.text = s; renderAppList(); }, appSearchStr);
+        } else if (screen == "hyperv") {
+            handleScroll(hvLayer, hvScrollY, 100);
+            if (hvEditingHost) handleHostInput();
+            // Auto-refresh a cada 3s
+            if (hvHost.length > 0 && hvVms.length > 0) {
+                hvAutoRefreshTimer += dt;
+                if (hvAutoRefreshTimer >= 3.0) {
+                    hvAutoRefreshTimer = 0;
+                    silentRefreshVMs();
+                }
+            }
+        } else if (screen == "hyperv-create") {
+            handleFormInput();
+        } else if (screen == "hyperv-details") {
+            if (Key.isPressed(Key.ESCAPE)) showHyperV();
+        }
+    }
+
+    function silentRefreshVMs() {
+        if (hvHost.length == 0) return;
+        var result = runBridge("hv-list-vms", {
+            hvHost: hvHost, username: usernameStr, password: passwordStr, domain: DOMAIN
+        });
+        if (result != null && Reflect.field(result, "status") == "ok") {
+            var data:Dynamic = Reflect.field(result, "data");
+            var vmsD:Dynamic = Reflect.field(data, "vms");
+            if (vmsD != null && Std.isOfType(vmsD, Array)) {
+                hvVms = cast vmsD;
+                renderVMList();
+            }
+        }
+    }
+
+    function handleHostInput() {
+        for (k in 0...256) {
+            if (!Key.isPressed(k)) continue;
+            if (k == Key.ENTER) {
+                hvEditingHost = false;
+                drawFieldBox(hvHostBorder, 145, 46, 200, 22, false);
+                loadVMs();
+                return;
+            }
+            if (k == Key.ESCAPE) { hvEditingHost = false; drawFieldBox(hvHostBorder, 145, 46, 200, 22, false); return; }
+            if (k == Key.BACKSPACE) {
+                if (hvHost.length > 0) { hvHost = hvHost.substr(0, hvHost.length - 1); hvHostDisplay.text = hvHost; }
+                return;
+            }
+            if (k >= Key.A && k <= Key.Z) {
+                var c = k - Key.A + 97;
+                if (Key.isDown(Key.LSHIFT) || Key.isDown(Key.RSHIFT)) c -= 32;
+                hvHost += String.fromCharCode(c); hvHostDisplay.text = hvHost; return;
+            }
+            if (k >= Key.NUMBER_0 && k <= Key.NUMBER_9) {
+                hvHost += String.fromCharCode(k - Key.NUMBER_0 + 48); hvHostDisplay.text = hvHost; return;
+            }
+            if (k == 189 || k == Key.NUMPAD_SUB) { hvHost += "-"; hvHostDisplay.text = hvHost; return; }
+            if (k == 190 || k == Key.NUMPAD_DOT) { hvHost += "."; hvHostDisplay.text = hvHost; return; }
+        }
+    }
+
+    function handleFormInput() {
+        if (hvFormActive == null || hvFormActive == "") return;
+        var cur = hvFormFields.get(hvFormActive);
+        if (cur == null) cur = "";
+        var disp = hvFormDisplays.get(hvFormActive);
+        for (k in 0...256) {
+            if (!Key.isPressed(k)) continue;
+            if (k == Key.TAB) {
+                // ciclar campo
+                var keys = ["name","memoryMB","vhdSizeGB","processors","generation","switchName"];
+                var idx = 0; for (i in 0...keys.length) if (keys[i] == hvFormActive) { idx = i; break; }
+                var nextIdx = (idx + 1) % keys.length;
+                setFormActive(keys[nextIdx]);
+                return;
+            }
+            if (k == Key.ENTER) { submitCreateVM(); return; }
+            if (k == Key.ESCAPE) { hvFormFields = null; showHyperV(); return; }
+            if (k == Key.BACKSPACE) {
+                if (cur.length > 0) { cur = cur.substr(0, cur.length - 1); hvFormFields.set(hvFormActive, cur); if (disp != null) disp.text = cur; }
+                return;
+            }
+            var ch:String = null;
+            if (k >= Key.A && k <= Key.Z) {
+                var c = k - Key.A + 97;
+                if (Key.isDown(Key.LSHIFT) || Key.isDown(Key.RSHIFT)) c -= 32;
+                ch = String.fromCharCode(c);
+            } else if (k >= Key.NUMBER_0 && k <= Key.NUMBER_9) {
+                ch = String.fromCharCode(k - Key.NUMBER_0 + 48);
+            } else if (k == 189 || k == Key.NUMPAD_SUB) {
+                ch = Key.isDown(Key.LSHIFT) || Key.isDown(Key.RSHIFT) ? "_" : "-";
+            } else if (k == 190 || k == Key.NUMPAD_DOT) {
+                ch = ".";
+            } else if (k == Key.SPACE) {
+                ch = " ";
+            }
+            if (ch != null) {
+                cur += ch; hvFormFields.set(hvFormActive, cur); if (disp != null) disp.text = cur;
+                return;
+            }
+        }
+    }
+
+    function handleModalInput() {
+        for (k in 0...256) {
+            if (!Key.isPressed(k)) continue;
+            if (k == Key.ENTER) {
+                var cb = modalCallback;
+                var v = modalValue;
+                closeModal();
+                if (cb != null) cb(v);
+                return;
+            }
+            if (k == Key.ESCAPE) { closeModal(); return; }
+            if (k == Key.BACKSPACE) {
+                if (modalValue.length > 0) { modalValue = modalValue.substr(0, modalValue.length - 1); if (modalDisplay != null) modalDisplay.text = modalValue; }
+                return;
+            }
+            var ch:String = null;
+            if (k >= Key.A && k <= Key.Z) {
+                var c = k - Key.A + 97;
+                if (Key.isDown(Key.LSHIFT) || Key.isDown(Key.RSHIFT)) c -= 32;
+                ch = String.fromCharCode(c);
+            } else if (k >= Key.NUMBER_0 && k <= Key.NUMBER_9) {
+                ch = String.fromCharCode(k - Key.NUMBER_0 + 48);
+            } else if (k == 189 || k == Key.NUMPAD_SUB) {
+                ch = Key.isDown(Key.LSHIFT) || Key.isDown(Key.RSHIFT) ? "_" : "-";
+            } else if (k == 190 || k == Key.NUMPAD_DOT) {
+                ch = ".";
+            } else if (k == Key.SPACE) {
+                ch = " ";
+            }
+            if (ch != null) {
+                modalValue += ch; if (modalDisplay != null) modalDisplay.text = modalValue;
+                return;
+            }
         }
     }
 

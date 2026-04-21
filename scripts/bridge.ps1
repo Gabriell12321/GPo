@@ -291,6 +291,276 @@ exit /b 0
             }
         }
 
+        "hv-list-hosts" {
+            # Procura computadores no AD com Hyper-V provavel (servers)
+            $domain = $args2.domain
+            $domainDN = ($domain -split '\.' | ForEach-Object { "DC=$_" }) -join ','
+            try {
+                $de = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$domainDN")
+                $searcher = New-Object System.DirectoryServices.DirectorySearcher($de)
+                $searcher.Filter = "(&(objectClass=computer)(operatingSystem=*Server*)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))"
+                $searcher.PropertiesToLoad.AddRange(@("cn","operatingSystem","dNSHostName"))
+                $searcher.PageSize = 500
+                $results = $searcher.FindAll()
+                $hosts = @()
+                foreach ($r in $results) {
+                    $cn = [string]$r.Properties["cn"][0]
+                    $os = if ($r.Properties["operatingsystem"].Count -gt 0) { [string]$r.Properties["operatingsystem"][0] } else { "" }
+                    $dns = if ($r.Properties["dnshostname"].Count -gt 0) { [string]$r.Properties["dnshostname"][0] } else { $cn }
+                    $hosts += @{ name = $cn; os = $os; dns = $dns }
+                }
+                $hosts = $hosts | Sort-Object { $_.name }
+                Write-Result "ok" $hosts
+            } catch {
+                Write-Result "error" -Message "Erro LDAP: $($_.Exception.Message)"
+            }
+        }
+
+        "hv-list-vms" {
+            $hvHost = $args2.hvHost
+            $user = $args2.username; $pass = $args2.password; $domain = $args2.domain
+            try {
+                $cred = New-Object System.Management.Automation.PSCredential("$domain\$user", (ConvertTo-SecureString $pass -AsPlainText -Force))
+                $result = Invoke-Command -ComputerName $hvHost -Credential $cred -ErrorAction Stop -ScriptBlock {
+                    if (-not (Get-Module -ListAvailable -Name Hyper-V)) { return @{ hvError = "Modulo Hyper-V nao instalado em $env:COMPUTERNAME" } }
+                    Import-Module Hyper-V -ErrorAction Stop
+                    $vms = Get-VM | ForEach-Object {
+                        [pscustomobject]@{
+                            name         = $_.Name
+                            state        = [string]$_.State
+                            status       = [string]$_.Status
+                            cpuUsage     = [int]$_.CPUUsage
+                            memAssigned  = [int]($_.MemoryAssigned / 1MB)
+                            memDemand    = [int]($_.MemoryDemand / 1MB)
+                            memStartup   = [int]($_.MemoryStartup / 1MB)
+                            processors   = [int]$_.ProcessorCount
+                            uptime       = if ($_.Uptime) { $_.Uptime.ToString("d\.hh\:mm\:ss") } else { "" }
+                            generation   = [int]$_.Generation
+                            version      = [string]$_.Version
+                            notes        = [string]$_.Notes
+                        }
+                    }
+                    return @{ ok = $true; vms = @($vms) }
+                }
+                if ($result.hvError) { Write-Result "error" -Message $result.hvError; return }
+                Write-Result "ok" @{ vms = @($result.vms) }
+            } catch {
+                Write-Result "error" -Message "Erro Hyper-V: $($_.Exception.Message)"
+            }
+        }
+
+        "hv-vm-action" {
+            $hvHost = $args2.hvHost; $vmName = $args2.vmName; $act = $args2.action
+            $user = $args2.username; $pass = $args2.password; $domain = $args2.domain
+            try {
+                $cred = New-Object System.Management.Automation.PSCredential("$domain\$user", (ConvertTo-SecureString $pass -AsPlainText -Force))
+                $result = Invoke-Command -ComputerName $hvHost -Credential $cred -ErrorAction Stop -ArgumentList $vmName, $act -ScriptBlock {
+                    param($name, $action)
+                    Import-Module Hyper-V -ErrorAction Stop
+                    switch ($action) {
+                        "start"    { Start-VM -Name $name -ErrorAction Stop }
+                        "stop"     { Stop-VM -Name $name -TurnOff -Force -ErrorAction Stop }
+                        "shutdown" { Stop-VM -Name $name -Force -ErrorAction Stop }
+                        "restart"  { Restart-VM -Name $name -Force -ErrorAction Stop }
+                        "save"     { Save-VM -Name $name -ErrorAction Stop }
+                        "pause"    { Suspend-VM -Name $name -ErrorAction Stop }
+                        "resume"   { Resume-VM -Name $name -ErrorAction Stop }
+                        default    { throw "Acao invalida: $action" }
+                    }
+                    $v = Get-VM -Name $name
+                    return @{ state = [string]$v.State; status = [string]$v.Status }
+                }
+                Write-Result "ok" $result
+            } catch {
+                Write-Result "error" -Message "Erro: $($_.Exception.Message)"
+            }
+        }
+
+        "hv-list-snapshots" {
+            $hvHost = $args2.hvHost; $vmName = $args2.vmName
+            $user = $args2.username; $pass = $args2.password; $domain = $args2.domain
+            try {
+                $cred = New-Object System.Management.Automation.PSCredential("$domain\$user", (ConvertTo-SecureString $pass -AsPlainText -Force))
+                $result = Invoke-Command -ComputerName $hvHost -Credential $cred -ErrorAction Stop -ArgumentList $vmName -ScriptBlock {
+                    param($name)
+                    Import-Module Hyper-V -ErrorAction Stop
+                    $snaps = Get-VMSnapshot -VMName $name -ErrorAction SilentlyContinue | ForEach-Object {
+                        [pscustomobject]@{
+                            name       = $_.Name
+                            created    = $_.CreationTime.ToString("dd/MM/yyyy HH:mm")
+                            parent     = [string]$_.ParentSnapshotName
+                            type       = [string]$_.SnapshotType
+                        }
+                    }
+                    return @{ snapshots = @($snaps) }
+                }
+                Write-Result "ok" $result
+            } catch {
+                Write-Result "error" -Message "Erro: $($_.Exception.Message)"
+            }
+        }
+
+        "hv-snapshot-action" {
+            $hvHost = $args2.hvHost; $vmName = $args2.vmName; $snapName = $args2.snapshotName; $act = $args2.action; $newName = $args2.newName
+            $user = $args2.username; $pass = $args2.password; $domain = $args2.domain
+            try {
+                $cred = New-Object System.Management.Automation.PSCredential("$domain\$user", (ConvertTo-SecureString $pass -AsPlainText -Force))
+                $result = Invoke-Command -ComputerName $hvHost -Credential $cred -ErrorAction Stop -ArgumentList $vmName, $snapName, $act, $newName -ScriptBlock {
+                    param($vm, $snap, $action, $newName)
+                    Import-Module Hyper-V -ErrorAction Stop
+                    switch ($action) {
+                        "create"  {
+                            $sn = if ([string]::IsNullOrWhiteSpace($newName)) { "Snap_$(Get-Date -Format 'yyyyMMdd_HHmmss')" } else { $newName }
+                            Checkpoint-VM -Name $vm -SnapshotName $sn -ErrorAction Stop
+                            return @{ created = $sn }
+                        }
+                        "restore" {
+                            Restore-VMSnapshot -VMName $vm -Name $snap -Confirm:$false -ErrorAction Stop
+                            return @{ restored = $snap }
+                        }
+                        "delete"  {
+                            Remove-VMSnapshot -VMName $vm -Name $snap -Confirm:$false -ErrorAction Stop
+                            return @{ deleted = $snap }
+                        }
+                        "rename"  {
+                            Rename-VMSnapshot -VMName $vm -Name $snap -NewName $newName -ErrorAction Stop
+                            return @{ renamed = $newName }
+                        }
+                        default   { throw "Acao invalida: $action" }
+                    }
+                }
+                Write-Result "ok" $result
+            } catch {
+                Write-Result "error" -Message "Erro: $($_.Exception.Message)"
+            }
+        }
+
+        "hv-vm-stats" {
+            $hvHost = $args2.hvHost; $vmName = $args2.vmName
+            $user = $args2.username; $pass = $args2.password; $domain = $args2.domain
+            try {
+                $cred = New-Object System.Management.Automation.PSCredential("$domain\$user", (ConvertTo-SecureString $pass -AsPlainText -Force))
+                $result = Invoke-Command -ComputerName $hvHost -Credential $cred -ErrorAction Stop -ArgumentList $vmName -ScriptBlock {
+                    param($name)
+                    Import-Module Hyper-V -ErrorAction Stop
+                    $v = Get-VM -Name $name -ErrorAction Stop
+                    $vhd = Get-VHD -VMId $v.VMId -ErrorAction SilentlyContinue | Select-Object -First 1
+                    $net = Get-VMNetworkAdapter -VMName $name -ErrorAction SilentlyContinue | Select-Object -First 1
+                    return @{
+                        name         = $v.Name
+                        state        = [string]$v.State
+                        status       = [string]$v.Status
+                        cpuUsage     = [int]$v.CPUUsage
+                        memAssigned  = [int]($v.MemoryAssigned / 1MB)
+                        memDemand    = [int]($v.MemoryDemand / 1MB)
+                        memStartup   = [int]($v.MemoryStartup / 1MB)
+                        memMinimum   = [int]($v.MemoryMinimum / 1MB)
+                        memMaximum   = [int]($v.MemoryMaximum / 1MB)
+                        processors   = [int]$v.ProcessorCount
+                        uptime       = if ($v.Uptime) { $v.Uptime.ToString("d\.hh\:mm\:ss") } else { "" }
+                        generation   = [int]$v.Generation
+                        vhdPath      = if ($vhd) { [string]$vhd.Path } else { "" }
+                        vhdSizeGB    = if ($vhd) { [math]::Round($vhd.Size / 1GB, 2) } else { 0 }
+                        vhdUsedGB    = if ($vhd) { [math]::Round($vhd.FileSize / 1GB, 2) } else { 0 }
+                        switchName   = if ($net) { [string]$net.SwitchName } else { "" }
+                        ipAddresses  = if ($net) { @($net.IPAddresses) -join "," } else { "" }
+                        macAddress   = if ($net) { [string]$net.MacAddress } else { "" }
+                    }
+                }
+                Write-Result "ok" $result
+            } catch {
+                Write-Result "error" -Message "Erro: $($_.Exception.Message)"
+            }
+        }
+
+        "hv-list-switches" {
+            $hvHost = $args2.hvHost
+            $user = $args2.username; $pass = $args2.password; $domain = $args2.domain
+            try {
+                $cred = New-Object System.Management.Automation.PSCredential("$domain\$user", (ConvertTo-SecureString $pass -AsPlainText -Force))
+                $result = Invoke-Command -ComputerName $hvHost -Credential $cred -ErrorAction Stop -ScriptBlock {
+                    Import-Module Hyper-V -ErrorAction Stop
+                    $sw = Get-VMSwitch | ForEach-Object {
+                        [pscustomobject]@{ name = $_.Name; type = [string]$_.SwitchType }
+                    }
+                    return @{ switches = @($sw) }
+                }
+                Write-Result "ok" $result
+            } catch {
+                Write-Result "error" -Message "Erro: $($_.Exception.Message)"
+            }
+        }
+
+        "hv-create-vm" {
+            $hvHost = $args2.hvHost; $vmName = $args2.vmName
+            $memoryMB = [int]$args2.memoryMB
+            $vhdSizeGB = [int]$args2.vhdSizeGB
+            $switchName = $args2.switchName
+            $generation = if ($args2.generation) { [int]$args2.generation } else { 2 }
+            $processors = if ($args2.processors) { [int]$args2.processors } else { 2 }
+            $user = $args2.username; $pass = $args2.password; $domain = $args2.domain
+            try {
+                $cred = New-Object System.Management.Automation.PSCredential("$domain\$user", (ConvertTo-SecureString $pass -AsPlainText -Force))
+                $result = Invoke-Command -ComputerName $hvHost -Credential $cred -ErrorAction Stop -ArgumentList $vmName,$memoryMB,$vhdSizeGB,$switchName,$generation,$processors -ScriptBlock {
+                    param($name, $memMB, $sizeGB, $sw, $gen, $procs)
+                    Import-Module Hyper-V -ErrorAction Stop
+                    if (Get-VM -Name $name -ErrorAction SilentlyContinue) { throw "VM '$name' ja existe" }
+
+                    $hvHostCfg = Get-VMHost
+                    $vhdDir = $hvHostCfg.VirtualHardDiskPath
+                    if (-not (Test-Path $vhdDir)) { New-Item $vhdDir -ItemType Directory -Force | Out-Null }
+                    $vhdPath = Join-Path $vhdDir ("$name.vhdx")
+
+                    New-VHD -Path $vhdPath -SizeBytes ([int64]$sizeGB * 1GB) -Dynamic -ErrorAction Stop | Out-Null
+
+                    $vmParams = @{
+                        Name               = $name
+                        MemoryStartupBytes = ([int64]$memMB * 1MB)
+                        Generation         = $gen
+                        VHDPath            = $vhdPath
+                    }
+                    if ($sw) { $vmParams.SwitchName = $sw }
+                    New-VM @vmParams -ErrorAction Stop | Out-Null
+                    Set-VM -Name $name -ProcessorCount $procs -ErrorAction SilentlyContinue
+                    Set-VMMemory -VMName $name -DynamicMemoryEnabled $true `
+                        -MinimumBytes ([int64]([math]::Max(512, $memMB / 2)) * 1MB) `
+                        -MaximumBytes ([int64]($memMB * 2) * 1MB) `
+                        -StartupBytes ([int64]$memMB * 1MB) -ErrorAction SilentlyContinue
+                    return @{ created = $name; vhd = $vhdPath }
+                }
+                Write-Result "ok" $result
+            } catch {
+                Write-Result "error" -Message "Erro ao criar VM: $($_.Exception.Message)"
+            }
+        }
+
+        "hv-delete-vm" {
+            $hvHost = $args2.hvHost; $vmName = $args2.vmName
+            $user = $args2.username; $pass = $args2.password; $domain = $args2.domain
+            $deleteVhd = if ($args2.deleteVhd) { [bool]$args2.deleteVhd } else { $false }
+            try {
+                $cred = New-Object System.Management.Automation.PSCredential("$domain\$user", (ConvertTo-SecureString $pass -AsPlainText -Force))
+                $result = Invoke-Command -ComputerName $hvHost -Credential $cred -ErrorAction Stop -ArgumentList $vmName, $deleteVhd -ScriptBlock {
+                    param($name, $delVhd)
+                    Import-Module Hyper-V -ErrorAction Stop
+                    $v = Get-VM -Name $name -ErrorAction Stop
+                    $vhdPaths = @()
+                    if ($delVhd) {
+                        $vhdPaths = @(Get-VHD -VMId $v.VMId -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Path)
+                    }
+                    if ($v.State -ne 'Off') { Stop-VM -Name $name -TurnOff -Force -ErrorAction SilentlyContinue }
+                    Remove-VM -Name $name -Force -ErrorAction Stop
+                    if ($delVhd) {
+                        foreach ($p in $vhdPaths) { if ($p -and (Test-Path $p)) { Remove-Item $p -Force -ErrorAction SilentlyContinue } }
+                    }
+                    return @{ deleted = $name; vhdsRemoved = $vhdPaths.Count }
+                }
+                Write-Result "ok" $result
+            } catch {
+                Write-Result "error" -Message "Erro ao remover VM: $($_.Exception.Message)"
+            }
+        }
+
         default {
             Write-Result "error" -Message "Comando desconhecido: $action"
         }
