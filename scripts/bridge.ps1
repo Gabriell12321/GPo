@@ -14,6 +14,45 @@ function Write-Result {
     [System.IO.File]::WriteAllText($OutputFile, $json, (New-Object System.Text.UTF8Encoding($false)))
 }
 
+function Get-HvCredential {
+    param($username, $password, $domain)
+    # Se usuario comeca com .\ ou HOST\, e conta local -> NTLM/Negotiate
+    # Se nao, usa dominio fornecido
+    $u = $username
+    if ($u -notmatch '\\' -and $u -notmatch '@') {
+        if ($domain -and $domain.Length -gt 0) { $u = "$domain\$username" }
+    }
+    $secPass = ConvertTo-SecureString $password -AsPlainText -Force
+    return New-Object System.Management.Automation.PSCredential($u, $secPass)
+}
+
+function Invoke-HvRemote {
+    # Wrapper que escolhe Kerberos (dominio) ou Negotiate (conta local) automaticamente
+    param(
+        [string]$ComputerName,
+        [System.Management.Automation.PSCredential]$Credential,
+        [ScriptBlock]$ScriptBlock,
+        [object[]]$ArgumentList = @()
+    )
+    $useNegotiate = ($Credential.UserName -match '^\.\\' -or $Credential.UserName -match '^[^\\]+\\' -and $Credential.UserName -notmatch '\.' )
+    # Heuristica: se username nao tem ponto no prefixo antes de \, tratar como local
+    if ($Credential.UserName -match '^\.\\') { $useNegotiate = $true }
+    elseif ($Credential.UserName -match '^([^\\]+)\\') {
+        $prefix = $Matches[1]
+        # Se prefixo igual ao ComputerName (sem dominio) ou curto sem ponto, usar Negotiate
+        if ($prefix -ieq $ComputerName -or $prefix -notmatch '\.') { $useNegotiate = $true }
+    }
+    $params = @{
+        ComputerName = $ComputerName
+        Credential   = $Credential
+        ScriptBlock  = $ScriptBlock
+        ErrorAction  = 'Stop'
+    }
+    if ($ArgumentList -and $ArgumentList.Count -gt 0) { $params.ArgumentList = $ArgumentList }
+    if ($useNegotiate) { $params.Authentication = 'Negotiate' }
+    Invoke-Command @params
+}
+
 try {
     if (-not (Test-Path $InputFile)) { Write-Result "error" -Message "Input file not found"; exit 1 }
     $cmd = Get-Content $InputFile -Raw | ConvertFrom-Json
@@ -320,8 +359,8 @@ exit /b 0
             $hvHost = $args2.hvHost
             $user = $args2.username; $pass = $args2.password; $domain = $args2.domain
             try {
-                $cred = New-Object System.Management.Automation.PSCredential("$domain\$user", (ConvertTo-SecureString $pass -AsPlainText -Force))
-                $result = Invoke-Command -ComputerName $hvHost -Credential $cred -ErrorAction Stop -ScriptBlock {
+                $cred = Get-HvCredential -username $user -password $pass -domain $domain
+                $result = Invoke-HvRemote -ComputerName $hvHost -Credential $cred -ScriptBlock {
                     if (-not (Get-Module -ListAvailable -Name Hyper-V)) { return @{ hvError = "Modulo Hyper-V nao instalado em $env:COMPUTERNAME" } }
                     Import-Module Hyper-V -ErrorAction Stop
                     $vms = Get-VM | ForEach-Object {
@@ -353,8 +392,8 @@ exit /b 0
             $hvHost = $args2.hvHost; $vmName = $args2.vmName; $act = $args2.action
             $user = $args2.username; $pass = $args2.password; $domain = $args2.domain
             try {
-                $cred = New-Object System.Management.Automation.PSCredential("$domain\$user", (ConvertTo-SecureString $pass -AsPlainText -Force))
-                $result = Invoke-Command -ComputerName $hvHost -Credential $cred -ErrorAction Stop -ArgumentList $vmName, $act -ScriptBlock {
+                $cred = Get-HvCredential -username $user -password $pass -domain $domain
+                $result = Invoke-HvRemote -ComputerName $hvHost -Credential $cred -ArgumentList $vmName, $act -ScriptBlock {
                     param($name, $action)
                     Import-Module Hyper-V -ErrorAction Stop
                     switch ($action) {
@@ -380,8 +419,8 @@ exit /b 0
             $hvHost = $args2.hvHost; $vmName = $args2.vmName
             $user = $args2.username; $pass = $args2.password; $domain = $args2.domain
             try {
-                $cred = New-Object System.Management.Automation.PSCredential("$domain\$user", (ConvertTo-SecureString $pass -AsPlainText -Force))
-                $result = Invoke-Command -ComputerName $hvHost -Credential $cred -ErrorAction Stop -ArgumentList $vmName -ScriptBlock {
+                $cred = Get-HvCredential -username $user -password $pass -domain $domain
+                $result = Invoke-HvRemote -ComputerName $hvHost -Credential $cred -ArgumentList $vmName -ScriptBlock {
                     param($name)
                     Import-Module Hyper-V -ErrorAction Stop
                     $snaps = Get-VMSnapshot -VMName $name -ErrorAction SilentlyContinue | ForEach-Object {
@@ -404,8 +443,8 @@ exit /b 0
             $hvHost = $args2.hvHost; $vmName = $args2.vmName; $snapName = $args2.snapshotName; $act = $args2.action; $newName = $args2.newName
             $user = $args2.username; $pass = $args2.password; $domain = $args2.domain
             try {
-                $cred = New-Object System.Management.Automation.PSCredential("$domain\$user", (ConvertTo-SecureString $pass -AsPlainText -Force))
-                $result = Invoke-Command -ComputerName $hvHost -Credential $cred -ErrorAction Stop -ArgumentList $vmName, $snapName, $act, $newName -ScriptBlock {
+                $cred = Get-HvCredential -username $user -password $pass -domain $domain
+                $result = Invoke-HvRemote -ComputerName $hvHost -Credential $cred -ArgumentList $vmName, $snapName, $act, $newName -ScriptBlock {
                     param($vm, $snap, $action, $newName)
                     Import-Module Hyper-V -ErrorAction Stop
                     switch ($action) {
@@ -439,8 +478,8 @@ exit /b 0
             $hvHost = $args2.hvHost; $vmName = $args2.vmName
             $user = $args2.username; $pass = $args2.password; $domain = $args2.domain
             try {
-                $cred = New-Object System.Management.Automation.PSCredential("$domain\$user", (ConvertTo-SecureString $pass -AsPlainText -Force))
-                $result = Invoke-Command -ComputerName $hvHost -Credential $cred -ErrorAction Stop -ArgumentList $vmName -ScriptBlock {
+                $cred = Get-HvCredential -username $user -password $pass -domain $domain
+                $result = Invoke-HvRemote -ComputerName $hvHost -Credential $cred -ArgumentList $vmName -ScriptBlock {
                     param($name)
                     Import-Module Hyper-V -ErrorAction Stop
                     $v = Get-VM -Name $name -ErrorAction Stop
@@ -477,8 +516,8 @@ exit /b 0
             $hvHost = $args2.hvHost
             $user = $args2.username; $pass = $args2.password; $domain = $args2.domain
             try {
-                $cred = New-Object System.Management.Automation.PSCredential("$domain\$user", (ConvertTo-SecureString $pass -AsPlainText -Force))
-                $result = Invoke-Command -ComputerName $hvHost -Credential $cred -ErrorAction Stop -ScriptBlock {
+                $cred = Get-HvCredential -username $user -password $pass -domain $domain
+                $result = Invoke-HvRemote -ComputerName $hvHost -Credential $cred -ScriptBlock {
                     Import-Module Hyper-V -ErrorAction Stop
                     $sw = Get-VMSwitch | ForEach-Object {
                         [pscustomobject]@{ name = $_.Name; type = [string]$_.SwitchType }
@@ -500,8 +539,8 @@ exit /b 0
             $processors = if ($args2.processors) { [int]$args2.processors } else { 2 }
             $user = $args2.username; $pass = $args2.password; $domain = $args2.domain
             try {
-                $cred = New-Object System.Management.Automation.PSCredential("$domain\$user", (ConvertTo-SecureString $pass -AsPlainText -Force))
-                $result = Invoke-Command -ComputerName $hvHost -Credential $cred -ErrorAction Stop -ArgumentList $vmName,$memoryMB,$vhdSizeGB,$switchName,$generation,$processors -ScriptBlock {
+                $cred = Get-HvCredential -username $user -password $pass -domain $domain
+                $result = Invoke-HvRemote -ComputerName $hvHost -Credential $cred -ArgumentList $vmName,$memoryMB,$vhdSizeGB,$switchName,$generation,$processors -ScriptBlock {
                     param($name, $memMB, $sizeGB, $sw, $gen, $procs)
                     Import-Module Hyper-V -ErrorAction Stop
                     if (Get-VM -Name $name -ErrorAction SilentlyContinue) { throw "VM '$name' ja existe" }
@@ -539,8 +578,8 @@ exit /b 0
             $user = $args2.username; $pass = $args2.password; $domain = $args2.domain
             $deleteVhd = if ($args2.deleteVhd) { [bool]$args2.deleteVhd } else { $false }
             try {
-                $cred = New-Object System.Management.Automation.PSCredential("$domain\$user", (ConvertTo-SecureString $pass -AsPlainText -Force))
-                $result = Invoke-Command -ComputerName $hvHost -Credential $cred -ErrorAction Stop -ArgumentList $vmName, $deleteVhd -ScriptBlock {
+                $cred = Get-HvCredential -username $user -password $pass -domain $domain
+                $result = Invoke-HvRemote -ComputerName $hvHost -Credential $cred -ArgumentList $vmName, $deleteVhd -ScriptBlock {
                     param($name, $delVhd)
                     Import-Module Hyper-V -ErrorAction Stop
                     $v = Get-VM -Name $name -ErrorAction Stop
@@ -558,6 +597,119 @@ exit /b 0
                 Write-Result "ok" $result
             } catch {
                 Write-Result "error" -Message "Erro ao remover VM: $($_.Exception.Message)"
+            }
+        }
+
+        "hv-test-connection" {
+            # Testa conectividade e auth para um host Hyper-V.
+            # Retorna diagnostico detalhado sem explodir a UI.
+            $hvHost = $args2.hvHost
+            $user = $args2.username; $pass = $args2.password; $domain = $args2.domain
+            $diag = @{
+                host       = $hvHost
+                port5985   = "unknown"
+                port5986   = "unknown"
+                authOk     = $false
+                authMethod = ""
+                hvOk       = $false
+                error      = ""
+            }
+            function Test-TcpQuick($h, $p) {
+                try {
+                    $c = New-Object System.Net.Sockets.TcpClient
+                    $ar = $c.BeginConnect($h, $p, $null, $null)
+                    $ok = $ar.AsyncWaitHandle.WaitOne(2500, $false)
+                    if ($ok -and $c.Connected) { $c.Close(); return "OPEN" }
+                    $c.Close(); return "TIMEOUT"
+                } catch { return "ERR" }
+            }
+            $diag.port5985 = Test-TcpQuick $hvHost 5985
+            $diag.port5986 = Test-TcpQuick $hvHost 5986
+            if ($diag.port5985 -ne "OPEN" -and $diag.port5986 -ne "OPEN") {
+                $diag.error = "Portas WinRM (5985/5986) fechadas. Verifique firewall e rede."
+                Write-Result "ok" $diag
+                return
+            }
+            try {
+                $cred = Get-HvCredential -username $user -password $pass -domain $domain
+                $r = Invoke-HvRemote -ComputerName $hvHost -Credential $cred -ScriptBlock {
+                    @{ name = $env:COMPUTERNAME; hasHv = ($null -ne (Get-Module -ListAvailable -Name Hyper-V)) }
+                }
+                $diag.authOk = $true
+                $diag.authMethod = if ($cred.UserName -match '^\.\\' -or ($cred.UserName -match '^([^\\]+)\\' -and $Matches[1] -notmatch '\.')) { "Negotiate/NTLM" } else { "Kerberos" }
+                $diag.hvOk = [bool]$r.hasHv
+                if (-not $diag.hvOk) { $diag.error = "Modulo Hyper-V nao instalado em $hvHost" }
+            } catch {
+                $diag.error = $_.Exception.Message
+            }
+            Write-Result "ok" $diag
+        }
+
+        "hv-configure-trusted-hosts" {
+            # Adiciona hosts a TrustedHosts local. REQUER ADMIN.
+            # Se nao for admin, relanca elevado via Start-Process e retorna status.
+            $hostsToAdd = $args2.hosts
+            if (-not $hostsToAdd -or $hostsToAdd.Count -eq 0) {
+                Write-Result "error" -Message "Nenhum host informado"
+                return
+            }
+            $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+            $hostsList = ($hostsToAdd | Where-Object { $_ }) -join ","
+
+            if (-not $isAdmin) {
+                # Tenta elevar via Start-Process -Verb RunAs executando script temporario
+                $tmp = [System.IO.Path]::Combine($env:TEMP, "set_trustedhosts_$([guid]::NewGuid().ToString('N')).ps1")
+                $psBody = @"
+try {
+    Start-Service WinRM -ErrorAction SilentlyContinue
+    `$cur = ''
+    try { `$cur = (Get-Item WSMan:\localhost\Client\TrustedHosts -ErrorAction Stop).Value } catch {}
+    `$new = '$hostsList'
+    if (`$cur -and `$cur.Trim().Length -gt 0) {
+        `$parts = @(`$cur -split ',' | ForEach-Object { `$_.Trim() } | Where-Object { `$_ })
+        foreach (`$h in (`$new -split ',')) { if (`$parts -notcontains `$h) { `$parts += `$h } }
+        `$new = (`$parts -join ',')
+    }
+    Set-Item WSMan:\localhost\Client\TrustedHosts -Value `$new -Force
+    '$tmp.ok' | Out-File "$tmp.result" -Encoding utf8
+} catch {
+    "ERR: `$(`$_.Exception.Message)" | Out-File "$tmp.result" -Encoding utf8
+}
+"@
+                Set-Content -Path $tmp -Value $psBody -Encoding UTF8
+                try {
+                    $p = Start-Process powershell -ArgumentList "-NoProfile","-ExecutionPolicy","Bypass","-File",$tmp -Verb RunAs -WindowStyle Hidden -PassThru -ErrorAction Stop
+                    $p.WaitForExit(30000) | Out-Null
+                    $resFile = "$tmp.result"
+                    $msg = if (Test-Path $resFile) { (Get-Content $resFile -Raw).Trim() } else { "sem resposta" }
+                    Remove-Item $tmp, $resFile -ErrorAction SilentlyContinue
+                    if ($msg -like "ERR:*") {
+                        Write-Result "error" -Message $msg
+                    } else {
+                        Write-Result "ok" @{ configured = $hostsList; method = "elevated" }
+                    }
+                } catch {
+                    Remove-Item $tmp -ErrorAction SilentlyContinue
+                    Write-Result "error" -Message "Falha ao elevar: $($_.Exception.Message). Execute o app como Administrador."
+                }
+                return
+            }
+
+            # Ja esta como admin
+            try {
+                Start-Service WinRM -ErrorAction SilentlyContinue
+                $cur = ""
+                try { $cur = (Get-Item WSMan:\localhost\Client\TrustedHosts -ErrorAction Stop).Value } catch {}
+                $new = $hostsList
+                if ($cur -and $cur.Trim().Length -gt 0) {
+                    $parts = @($cur -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+                    foreach ($h in ($new -split ',')) { if ($parts -notcontains $h) { $parts += $h } }
+                    $new = ($parts -join ',')
+                }
+                Set-Item WSMan:\localhost\Client\TrustedHosts -Value $new -Force
+                Write-Result "ok" @{ configured = $new; method = "direct" }
+            } catch {
+                Write-Result "error" -Message "Erro: $($_.Exception.Message)"
             }
         }
 

@@ -62,6 +62,9 @@ class Main extends hxd.App {
     // Hyper-V Manager
     var hvHost:String = "";
     var hvLayer:h2d.Object;
+    var hvAltUser:String = "";  // Credencial alternativa (conta local Hyper-V)
+    var hvAltPass:String = "";
+    var hvAltDomain:String = "";
     var hvScrollY:Float = 0;
     var hvVms:Array<Dynamic> = [];
     var hvStatusText:Text;
@@ -689,6 +692,35 @@ class Main extends hxd.App {
         if (hvStatusText != null) { hvStatusText.text = msg; hvStatusText.textColor = color; }
     }
 
+    function hvUser():String { return hvAltUser.length > 0 ? hvAltUser : usernameStr; }
+    function hvPass():String { return hvAltUser.length > 0 ? hvAltPass : passwordStr; }
+    function hvDomain():String { return hvAltUser.length > 0 ? hvAltDomain : DOMAIN; }
+
+    function openAltCredModal() {
+        openTextModal("Usuario alt. (ex: .\\johnny.zack ou dom\\user) - ENTER", hvAltUser, function(u) {
+            if (u == null || u.length == 0) {
+                hvAltUser = ""; hvAltPass = ""; hvAltDomain = "";
+                setHvStatus("Usando credenciais do login", 0xA6ADC8);
+                return;
+            }
+            // Se comeca com .\ ou HOST\ deixamos em hvAltUser; dominio separado apenas se formato dom\user
+            hvAltUser = u;
+            hvAltDomain = "";
+            if (u.indexOf("\\") > 0 && u.charAt(0) != ".") {
+                var idx = u.indexOf("\\");
+                hvAltDomain = u.substr(0, idx);
+                hvAltUser = u.substr(idx + 1);
+            } else if (u.charAt(0) == ".") {
+                // .\user -> hvAltUser="user", sem dominio (bridge trata como local se user nao tem dominio)
+                hvAltUser = u.substr(2);
+            }
+            openTextModal("Senha para " + u + " - ENTER", "", function(p) {
+                hvAltPass = p;
+                setHvStatus("Credencial alt. definida: " + u, 0xA6E3A1);
+            });
+        });
+    }
+
     function showHyperV() {
         screen = "hyperv";
         s2d.removeChildren();
@@ -724,6 +756,11 @@ class Main extends hxd.App {
             if (hvHost.length == 0) { setHvStatus("Informe o host primeiro", 0xF9E2AF); return; }
             showCreateVMForm();
         });
+        makeButton("Testar", 655, 46, 70, 22, function() { testConnection(); });
+        makeButton("Config WinRM", 735, 46, 110, 22, function() { configTrustedHosts(); });
+
+        var credLbl = hvAltUser.length > 0 ? ("Cred: " + hvAltUser + " [mudar]") : "Usar cred alternativa";
+        makeButton(credLbl, 855, 46, 250, 22, function() { openAltCredModal(); });
 
         hvStatusText = makeText(hvHost.length == 0 ? "Informe o host Hyper-V e clique Conectar" : "Pronto", 1.2, 0xF9E2AF);
         hvStatusText.x = 10; hvStatusText.y = 76;
@@ -736,11 +773,52 @@ class Main extends hxd.App {
         }
     }
 
+    function testConnection() {
+        if (hvHost.length == 0) { setHvStatus("Host vazio", 0xF38BA8); return; }
+        setHvStatus("Testando " + hvHost + "...", 0xF9E2AF);
+        var result = runBridge("hv-test-connection", {
+            hvHost: hvHost, username: hvUser(), password: hvPass(), domain: hvDomain()
+        });
+        if (result == null) { setHvStatus("Bridge falhou", 0xF38BA8); return; }
+        if (Reflect.field(result, "status") != "ok") {
+            setHvStatus("Erro: " + Std.string(Reflect.field(result, "message")), 0xF38BA8);
+            return;
+        }
+        var d:Dynamic = Reflect.field(result, "data");
+        var p5985:String = Std.string(Reflect.field(d, "port5985"));
+        var p5986:String = Std.string(Reflect.field(d, "port5986"));
+        var authOk:Bool = Reflect.field(d, "authOk") == true;
+        var hvOk:Bool = Reflect.field(d, "hvOk") == true;
+        var method:String = Std.string(Reflect.field(d, "authMethod"));
+        var err:String = Std.string(Reflect.field(d, "error"));
+        var portStatus = "5985=" + p5985 + " 5986=" + p5986;
+        if (!authOk) {
+            setHvStatus(portStatus + " | Auth FALHOU: " + err, 0xF38BA8);
+        } else if (!hvOk) {
+            setHvStatus(portStatus + " | Auth OK (" + method + ") mas Hyper-V nao instalado", 0xF9E2AF);
+        } else {
+            setHvStatus(portStatus + " | Auth OK (" + method + ") | Hyper-V pronto", 0xA6E3A1);
+        }
+    }
+
+    function configTrustedHosts() {
+        if (hvHost.length == 0) { setHvStatus("Informe o host primeiro", 0xF9E2AF); return; }
+        setHvStatus("Configurando TrustedHosts (sera solicitado UAC)...", 0xF9E2AF);
+        var result = runBridge("hv-configure-trusted-hosts", { hosts: [hvHost] });
+        if (result == null) { setHvStatus("Bridge falhou", 0xF38BA8); return; }
+        if (Reflect.field(result, "status") == "ok") {
+            var d:Dynamic = Reflect.field(result, "data");
+            setHvStatus("WinRM configurado: TrustedHosts = " + Std.string(Reflect.field(d, "configured")), 0xA6E3A1);
+        } else {
+            setHvStatus("Erro: " + Std.string(Reflect.field(result, "message")), 0xF38BA8);
+        }
+    }
+
     function loadVMs() {
         if (hvHost.length == 0) { setHvStatus("Host vazio", 0xF38BA8); return; }
         setHvStatus("Listando VMs em " + hvHost + "...", 0xF9E2AF);
         var result = runBridge("hv-list-vms", {
-            hvHost: hvHost, username: usernameStr, password: passwordStr, domain: DOMAIN
+            hvHost: hvHost, username: hvUser(), password: hvPass(), domain: hvDomain()
         });
         if (result == null) { setHvStatus("Bridge falhou", 0xF38BA8); return; }
         var status:String = Reflect.field(result, "status");
@@ -853,7 +931,7 @@ class Main extends hxd.App {
         setHvStatus("Executando '" + act + "' em " + vmName + "...", 0xF9E2AF);
         var result = runBridge("hv-vm-action", {
             hvHost: hvHost, vmName: vmName, action: act,
-            username: usernameStr, password: passwordStr, domain: DOMAIN
+            username: hvUser(), password: hvPass(), domain: hvDomain()
         });
         if (result != null && Reflect.field(result, "status") == "ok") {
             setHvStatus("OK: " + vmName + " -> " + act, 0xA6E3A1);
@@ -868,7 +946,7 @@ class Main extends hxd.App {
         setHvStatus("Criando snapshot de " + vmName + "...", 0xF9E2AF);
         var result = runBridge("hv-snapshot-action", {
             hvHost: hvHost, vmName: vmName, action: "create", newName: snapName,
-            username: usernameStr, password: passwordStr, domain: DOMAIN
+            username: hvUser(), password: hvPass(), domain: hvDomain()
         });
         if (result != null && Reflect.field(result, "status") == "ok") {
             var data:Dynamic = Reflect.field(result, "data");
@@ -883,7 +961,7 @@ class Main extends hxd.App {
         setHvStatus("Removendo VM " + vmName + "...", 0xF9E2AF);
         var result = runBridge("hv-delete-vm", {
             hvHost: hvHost, vmName: vmName, deleteVhd: delVhd,
-            username: usernameStr, password: passwordStr, domain: DOMAIN
+            username: hvUser(), password: hvPass(), domain: hvDomain()
         });
         if (result != null && Reflect.field(result, "status") == "ok") {
             setHvStatus("VM removida: " + vmName, 0xA6E3A1);
@@ -918,7 +996,7 @@ class Main extends hxd.App {
         // Stats box
         var statsResult = runBridge("hv-vm-stats", {
             hvHost: hvHost, vmName: name,
-            username: usernameStr, password: passwordStr, domain: DOMAIN
+            username: hvUser(), password: hvPass(), domain: hvDomain()
         });
         if (statsResult != null && Reflect.field(statsResult, "status") == "ok") {
             var s:Dynamic = Reflect.field(statsResult, "data");
@@ -954,7 +1032,7 @@ class Main extends hxd.App {
         // Snapshots list
         var snapResult = runBridge("hv-list-snapshots", {
             hvHost: hvHost, vmName: name,
-            username: usernameStr, password: passwordStr, domain: DOMAIN
+            username: hvUser(), password: hvPass(), domain: hvDomain()
         });
         var y2:Float = 260;
         addLayerText(s2d, "═══ Snapshots ═══", 10, y2, 1.3, 0xCBA6F7);
@@ -1009,7 +1087,7 @@ class Main extends hxd.App {
         setHvStatus(act + " " + snapName + "...", 0xF9E2AF);
         var result = runBridge("hv-snapshot-action", {
             hvHost: hvHost, vmName: vmName, snapshotName: snapName, action: act,
-            username: usernameStr, password: passwordStr, domain: DOMAIN
+            username: hvUser(), password: hvPass(), domain: hvDomain()
         });
         if (result != null && Reflect.field(result, "status") == "ok") {
             setHvStatus("OK: " + act + " " + snapName, 0xA6E3A1);
@@ -1050,7 +1128,7 @@ class Main extends hxd.App {
         var firstSw = "";
         if (hvSwitches == null || hvSwitches.length == 0) {
             var swRes = runBridge("hv-list-switches", {
-                hvHost: hvHost, username: usernameStr, password: passwordStr, domain: DOMAIN
+                hvHost: hvHost, username: hvUser(), password: hvPass(), domain: hvDomain()
             });
             if (swRes != null && Reflect.field(swRes, "status") == "ok") {
                 var d:Dynamic = Reflect.field(swRes, "data");
@@ -1132,7 +1210,7 @@ class Main extends hxd.App {
         var result = runBridge("hv-create-vm", {
             hvHost: hvHost, vmName: nm, memoryMB: memMB, vhdSizeGB: sizeGB,
             processors: procs, generation: gen, switchName: hvFormFields.get("switchName"),
-            username: usernameStr, password: passwordStr, domain: DOMAIN
+            username: hvUser(), password: hvPass(), domain: hvDomain()
         });
         if (result != null && Reflect.field(result, "status") == "ok") {
             hvFormStatus.text = "VM criada: " + nm + ". Voltando...";
@@ -1311,7 +1389,7 @@ class Main extends hxd.App {
     function silentRefreshVMs() {
         if (hvHost.length == 0) return;
         var result = runBridge("hv-list-vms", {
-            hvHost: hvHost, username: usernameStr, password: passwordStr, domain: DOMAIN
+            hvHost: hvHost, username: hvUser(), password: hvPass(), domain: hvDomain()
         });
         if (result != null && Reflect.field(result, "status") == "ok") {
             var data:Dynamic = Reflect.field(result, "data");
