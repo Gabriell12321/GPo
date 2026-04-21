@@ -202,24 +202,30 @@ function Get-BlockedPatterns {
                 if (Test-Path $cfg.RemoteBlockedAppsPath -ErrorAction Stop) {
                     $remote = Get-Content $cfg.RemoteBlockedAppsPath -Raw -ErrorAction Stop | ConvertFrom-Json
                     $hostname = $env:COMPUTERNAME
-                    # UNIAO: Global + Machine (sem duplicatas)
-                    $globalList = @(); $machineList = @()
+                    # UNIAO com opt-out: (Global - Exceptions) + Extras
+                    $globalList = @(); $machineList = @(); $exceptions = @()
                     if ($remote.Global) { $globalList = @($remote.Global) }
                     $hasMachine = $false
                     if ($remote.Machines -and $remote.Machines.PSObject.Properties[$hostname]) {
                         $mList = @($remote.Machines.$hostname)
                         if ($mList.Count -gt 0) { $machineList = $mList; $hasMachine = $true }
                     }
+                    if ($remote.Exceptions -and $remote.Exceptions.PSObject.Properties[$hostname]) {
+                        $exceptions = @($remote.Exceptions.$hostname)
+                        if ($exceptions.Count -gt 0) { $hasMachine = $true }
+                    }
+                    $excSet = @{}
+                    foreach ($x in $exceptions) { $excSet["$x".ToLower()] = $true }
                     $newCache = @()
                     $seen = @{}
-                    foreach ($x in $globalList)  { $k = "$x".ToLower(); if (-not $seen.ContainsKey($k)) { $newCache += $x; $seen[$k] = $true } }
+                    foreach ($x in $globalList)  { $k = "$x".ToLower(); if (-not $excSet.ContainsKey($k) -and -not $seen.ContainsKey($k)) { $newCache += $x; $seen[$k] = $true } }
                     foreach ($x in $machineList) { $k = "$x".ToLower(); if (-not $seen.ContainsKey($k)) { $newCache += $x; $seen[$k] = $true } }
                     $script:RemoteBlockCache = $newCache
                     $script:LastRemoteFetch = Get-Date
                     $fetched = $true
                     Save-PatternsCache -Patterns $newCache
                     $src = if ($hasMachine) { "global+machine" } else { "global" }
-                    Write-Log "Remote blocked apps ($src): $($newCache.Count) patterns (G=$($globalList.Count) M=$($machineList.Count))"
+                    Write-Log "Remote blocked apps ($src): $($newCache.Count) patterns (G=$($globalList.Count) M=$($machineList.Count) X=$($exceptions.Count))"
                 }
             } catch {
                 Write-Log "Erro ao ler share (usando cache): $($_.Exception.Message)" "WARN"
@@ -384,24 +390,30 @@ function Get-BlockedHosts {
                 if (Test-Path $cfg.RemoteBlockedHostsPath -ErrorAction Stop) {
                     $remote = Get-Content $cfg.RemoteBlockedHostsPath -Raw -ErrorAction Stop | ConvertFrom-Json
                     $hostname = $env:COMPUTERNAME
-                    # UNIAO: Global + Machine (sem duplicatas)
-                    $globalList = @(); $machineList = @()
+                    # UNIAO com opt-out: (Global - Exceptions) + Extras
+                    $globalList = @(); $machineList = @(); $exceptions = @()
                     if ($remote.Global) { $globalList = @($remote.Global) }
                     $hasMachine = $false
                     if ($remote.Machines -and $remote.Machines.PSObject.Properties[$hostname]) {
                         $mList = @($remote.Machines.$hostname)
                         if ($mList.Count -gt 0) { $machineList = $mList; $hasMachine = $true }
                     }
+                    if ($remote.Exceptions -and $remote.Exceptions.PSObject.Properties[$hostname]) {
+                        $exceptions = @($remote.Exceptions.$hostname)
+                        if ($exceptions.Count -gt 0) { $hasMachine = $true }
+                    }
+                    $excSet = @{}
+                    foreach ($x in $exceptions) { $excSet["$x".ToLower()] = $true }
                     $newCache = @()
                     $seen = @{}
-                    foreach ($x in $globalList)  { $k = "$x".ToLower(); if (-not $seen.ContainsKey($k)) { $newCache += $x; $seen[$k] = $true } }
+                    foreach ($x in $globalList)  { $k = "$x".ToLower(); if (-not $excSet.ContainsKey($k) -and -not $seen.ContainsKey($k)) { $newCache += $x; $seen[$k] = $true } }
                     foreach ($x in $machineList) { $k = "$x".ToLower(); if (-not $seen.ContainsKey($k)) { $newCache += $x; $seen[$k] = $true } }
                     $script:RemoteHostsCache = $newCache
                     $script:LastHostsFetch = Get-Date
                     Save-HostsCache -Entries $newCache
                     $fetched = $true
                     $src = if ($hasMachine) { "global+machine" } else { "global" }
-                    Write-Log "Remote blocked hosts ($src): $($newCache.Count) entries (G=$($globalList.Count) M=$($machineList.Count))"
+                    Write-Log "Remote blocked hosts ($src): $($newCache.Count) entries (G=$($globalList.Count) M=$($machineList.Count) X=$($exceptions.Count))"
                 }
             } catch {
                 Write-Log "Erro ao ler hosts share: $($_.Exception.Message)" "WARN"
@@ -565,14 +577,15 @@ function Get-BlockedPolicies {
         if (Test-Path $path -ErrorAction Stop) {
             $j = Get-Content $path -Raw -ErrorAction Stop | ConvertFrom-Json
             $hostname = $env:COMPUTERNAME
-            # UNIAO (OR logico): Global OU Machine = bloqueado
-            $gWidgets = $false; $mWidgets = $false
+            # Efetivo: (Global OR Machine.Widgets) AND NOT Machine.WidgetsDisabled
+            $gWidgets = $false; $mWidgets = $false; $mDisabled = $false
             if ($j.Global -and $j.Global.PSObject.Properties['Widgets']) { $gWidgets = [bool]$j.Global.Widgets }
             if ($j.Machines -and $j.Machines.PSObject.Properties[$hostname]) {
                 $m = $j.Machines.$hostname
                 if ($m -and $m.PSObject.Properties['Widgets']) { $mWidgets = [bool]$m.Widgets }
+                if ($m -and $m.PSObject.Properties['WidgetsDisabled']) { $mDisabled = [bool]$m.WidgetsDisabled }
             }
-            $result.Widgets = $gWidgets -or $mWidgets
+            $result.Widgets = ($gWidgets -or $mWidgets) -and (-not $mDisabled)
             $script:RemotePoliciesCache = $result
             $script:LastPoliciesFetch = Get-Date
         }

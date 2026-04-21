@@ -56,6 +56,7 @@ class Main extends hxd.App {
     var blockedApps:Array<String> = [];
     var appCheckStates:Map<String, Bool>;
     var appGlobalSet:Map<String, Bool>;  // apps que estao no Global (para marcar visualmente)
+    var appExceptions:Map<String, Bool>;  // itens do Global marcados como excecao neste PC (opt-out)
     var appSearchStr:String = "";
     var appSearchDisplay:Text;
     var appSearchBorder:Graphics;
@@ -72,6 +73,7 @@ class Main extends hxd.App {
     var editingHostInput:Bool = false;
     var hostStatusText:Text;
     var hostGlobalSet:Map<String, Bool>;  // entradas que vem do Global
+    var hostExceptions:Map<String, Bool>;  // entradas do Global marcadas como excecao neste PC
 
     // Politicas Extras (Widgets/Noticias)
     var policyLayer:h2d.Object;
@@ -573,6 +575,18 @@ class Main extends hxd.App {
                         if (s.length > 0) appGlobalSet.set(s, true);
                     }
                 }
+                // Popula Exceptions (itens do Global que este PC opta por NAO bloquear)
+                appExceptions = new Map();
+                var excArr:Dynamic = Reflect.field(data, "exceptions");
+                if (excArr != null) {
+                    if (Std.isOfType(excArr, Array)) {
+                        var arr:Array<Dynamic> = cast excArr;
+                        for (item in arr) appExceptions.set(Std.string(item).toLowerCase(), true);
+                    } else {
+                        var s = Std.string(excArr).toLowerCase();
+                        if (s.length > 0) appExceptions.set(s, true);
+                    }
+                }
                 var allApps:Dynamic = Reflect.field(data, "allApps");
                 if (allApps != null) {
                     if (Std.isOfType(allApps, Array)) {
@@ -630,6 +644,7 @@ class Main extends hxd.App {
 
             var isBlocked = appCheckStates.exists(procName) && appCheckStates.get(procName);
             var isGlobal = appGlobalSet != null && appGlobalSet.exists(procName);
+            var isException = appExceptions != null && appExceptions.exists(procName);
             var rowColor:Int = isBlocked ? 0x45283C : ((i % 2 == 0) ? 0x313244 : 0x1E1E2E);
 
             var row = new Graphics(appLayer);
@@ -648,15 +663,36 @@ class Main extends hxd.App {
             addLayerText(appLayer, displayName, 40, y + 3, 1.0, isBlocked ? 0xF38BA8 : 0xCDD6F4);
             addLayerText(appLayer, procName, 300, y + 3, 1.0, 0x6C7086);
             addLayerText(appLayer, category, 480, y + 3, 1.0, 0x585B70);
-            if (isGlobal) addLayerText(appLayer, "G", Std.int(w) - 30, y + 3, 1.1, 0x89B4FA);
+            if (isGlobal) {
+                if (isException) {
+                    // Global com opt-out neste PC
+                    addLayerText(appLayer, "G-", Std.int(w) - 30, y + 3, 1.1, 0xF38BA8);
+                } else {
+                    addLayerText(appLayer, "G", Std.int(w) - 30, y + 3, 1.1, 0x89B4FA);
+                }
+            }
 
             // Click
             var area2 = new Interactive(w, 20, appLayer);
             area2.x = 0; area2.y = y; area2.cursor = Button;
             var pn = procName;
+            var pnIsGlobal = isGlobal;
             area2.onClick = function(_) {
-                var cur = appCheckStates.exists(pn) && appCheckStates.get(pn);
-                appCheckStates.set(pn, !cur);
+                if (pnIsGlobal) {
+                    // Toggle exception: se estava bloqueado via Global, cria excecao (desmarca)
+                    // Se ja havia excecao, remove (volta a bloquear via Global)
+                    if (appExceptions == null) appExceptions = new Map();
+                    if (appExceptions.exists(pn)) {
+                        appExceptions.remove(pn);
+                        appCheckStates.set(pn, true);
+                    } else {
+                        appExceptions.set(pn, true);
+                        appCheckStates.set(pn, false);
+                    }
+                } else {
+                    var cur = appCheckStates.exists(pn) && appCheckStates.get(pn);
+                    appCheckStates.set(pn, !cur);
+                }
                 renderAppList();
             };
 
@@ -673,29 +709,33 @@ class Main extends hxd.App {
                 apps.push(app[0]);
             }
         }
-        // Para scope=machine: salva APENAS os extras (itens que NAO estao no Global)
-        // Assim editar PC nao polui o JSON com copias do Global
+        // Para scope=machine: envia APENAS extras (nao-Global) + exceptions (opt-outs)
+        var exceptions:Array<String> = [];
         if (scope == "machine" && appGlobalSet != null) {
             var extras:Array<String> = [];
             for (a in apps) {
                 if (!appGlobalSet.exists(a.toLowerCase())) extras.push(a);
             }
             apps = extras;
+            if (appExceptions != null) {
+                for (k in appExceptions.keys()) exceptions.push(k);
+            }
         }
         var result = runBridge("save-blocked-apps", {
             sharePath: sharePath,
             hostname: pcName,
             apps: apps,
+            exceptions: exceptions,
             scope: scope
         });
         if (result != null && Reflect.field(result, "status") == "ok") {
-            var label = switch (scope) { case "global": "GLOBAL"; case "clear": "SEM EXTRAS (so Global)"; default: pcName + " (extras)"; };
             if (scope == "clear") {
-                appStatusText.text = "Extras do " + pcName + " removidos - agora so recebe o Global";
+                appStatusText.text = "Extras e excecoes de " + pcName + " removidos - agora so recebe o Global";
                 loadCurrentBlocks(pcName);
                 renderAppList();
             } else if (scope == "machine") {
-                appStatusText.text = "Salvo extras de " + pcName + ": " + apps.length + " apps (soma com " + (appGlobalSet != null ? Lambda.count(appGlobalSet) : 0) + " do Global)";
+                var gc = appGlobalSet != null ? Lambda.count(appGlobalSet) : 0;
+                appStatusText.text = "Salvo " + pcName + ": " + apps.length + " extras + " + exceptions.length + " excecoes (Global tem " + gc + ")";
                 loadCurrentBlocks(pcName);
                 renderAppList();
             } else {
@@ -849,6 +889,7 @@ class Main extends hxd.App {
     function loadBlockedHosts(pcName:String) {
         blockedHostsList = [];
         hostGlobalSet = new Map();
+        hostExceptions = new Map();
         var result = runBridge("get-blocked-hosts", {sharePath: hostsSharePath(), hostname: pcName});
         if (result != null && Reflect.field(result, "status") == "ok") {
             var data:Dynamic = Reflect.field(result, "data");
@@ -860,6 +901,16 @@ class Main extends hxd.App {
                 } else {
                     var s = Std.string(globalArr).toLowerCase();
                     if (s.length > 0) hostGlobalSet.set(s, true);
+                }
+            }
+            var excArr:Dynamic = Reflect.field(data, "exceptions");
+            if (excArr != null) {
+                if (Std.isOfType(excArr, Array)) {
+                    var arr:Array<Dynamic> = cast excArr;
+                    for (item in arr) hostExceptions.set(Std.string(item).toLowerCase(), true);
+                } else {
+                    var s = Std.string(excArr).toLowerCase();
+                    if (s.length > 0) hostExceptions.set(s, true);
                 }
             }
             var all:Dynamic = Reflect.field(data, "allHosts");
@@ -889,11 +940,16 @@ class Main extends hxd.App {
         addLayerText(hostLayer, "Acao", Std.int(w) - 90, y + 3, 1.2, 0xCDD6F4);
         y += 24;
 
-        if (blockedHostsList.length == 0) {
+        // Lista de excecoes (Global desativados neste PC) vem no topo
+        var excList:Array<String> = [];
+        if (hostExceptions != null) for (k in hostExceptions.keys()) excList.push(k);
+
+        if (blockedHostsList.length == 0 && excList.length == 0) {
             addLayerText(hostLayer, "(nenhum site/IP bloqueado - adicione acima)", 10, y + 3, 1.1, 0x6C7086);
             return;
         }
 
+        // --- Ativos ---
         for (i in 0...blockedHostsList.length) {
             var entry = blockedHostsList[i];
             var isIp = isIpLike(entry);
@@ -909,26 +965,73 @@ class Main extends hxd.App {
             addLayerText(hostLayer, entry, 10, y + 3, 1.1, 0xF38BA8);
             addLayerText(hostLayer, tipo, Std.int(w) - 220, y + 3, 1.0, tipoColor);
 
-            // Remove button
+            // Action button: Remover (itens do PC) OU "So aqui" (excluir deste PC se for Global)
+            var btnLabel = isGlobal ? "So aqui" : "Remover";
             var btn = new Graphics(hostLayer);
             btn.beginFill(0x585B70); btn.drawRect(Std.int(w) - 90, y + 2, 80, 18); btn.endFill();
-            addLayerText(hostLayer, "Remover", Std.int(w) - 82, y + 4, 1.0, 0xF38BA8);
+            addLayerText(hostLayer, btnLabel, Std.int(w) - 82, y + 4, 1.0, 0xF38BA8);
             var area = new Interactive(80, 18, hostLayer);
             area.x = Std.int(w) - 90; area.y = y + 2; area.cursor = Button;
             var idx = i;
             var entryCopy = entry;
             var entryIsGlobal = isGlobal;
             area.onClick = function(_) {
-                if (entryIsGlobal && hostStatusText != null) {
-                    hostStatusText.text = "'" + entryCopy + "' vem do GLOBAL - va em outro PC e use 'Salvar Global' para tirar da lista geral";
-                    hostStatusText.textColor = 0xF9E2AF;
-                    return;
+                if (entryIsGlobal) {
+                    // Cria excecao neste PC
+                    if (hostExceptions == null) hostExceptions = new Map();
+                    hostExceptions.set(entryCopy.toLowerCase(), true);
+                    blockedHostsList.splice(idx, 1);
+                    if (hostStatusText != null) {
+                        hostStatusText.text = "'" + entryCopy + "' desativado SO neste PC (clique 'Salvar p/ PC' para aplicar)";
+                        hostStatusText.textColor = 0xF9E2AF;
+                    }
+                } else {
+                    blockedHostsList.splice(idx, 1);
                 }
-                blockedHostsList.splice(idx, 1);
                 renderHostList();
             };
 
             y += 22;
+        }
+
+        // --- Excecoes (itens do Global desativados neste PC) ---
+        if (excList.length > 0) {
+            var sep = new Graphics(hostLayer);
+            sep.beginFill(0x181825); sep.drawRect(0, y, w, 20); sep.endFill();
+            addLayerText(hostLayer, "── Desativados SO neste PC (vem do Global) ──", 10, y + 2, 1.0, 0xF9E2AF);
+            y += 22;
+
+            for (i in 0...excList.length) {
+                var entry = excList[i];
+                var isIp = isIpLike(entry);
+                var tipoBase = isIp ? "IP (firewall)" : "Site (hosts)";
+                var tipo = tipoBase + " [G-]";
+                var rowColor:Int = (i % 2 == 0) ? 0x2A2A3C : 0x1E1E2E;
+
+                var row = new Graphics(hostLayer);
+                row.beginFill(rowColor); row.drawRect(0, y, w, 22); row.endFill();
+
+                addLayerText(hostLayer, entry, 10, y + 3, 1.1, 0x6C7086);
+                addLayerText(hostLayer, tipo, Std.int(w) - 220, y + 3, 1.0, 0xF9E2AF);
+
+                var btn = new Graphics(hostLayer);
+                btn.beginFill(0x585B70); btn.drawRect(Std.int(w) - 90, y + 2, 80, 18); btn.endFill();
+                addLayerText(hostLayer, "Reativar", Std.int(w) - 85, y + 4, 1.0, 0xA6E3A1);
+                var area = new Interactive(80, 18, hostLayer);
+                area.x = Std.int(w) - 90; area.y = y + 2; area.cursor = Button;
+                var entryCopy = entry;
+                area.onClick = function(_) {
+                    hostExceptions.remove(entryCopy.toLowerCase());
+                    blockedHostsList.push(entryCopy);
+                    if (hostStatusText != null) {
+                        hostStatusText.text = "'" + entryCopy + "' reativado (clique 'Salvar p/ PC' para aplicar)";
+                        hostStatusText.textColor = 0xA6E3A1;
+                    }
+                    renderHostList();
+                };
+
+                y += 22;
+            }
         }
     }
 
@@ -957,30 +1060,33 @@ class Main extends hxd.App {
 
     function saveHosts(scope:String) {
         var pcName:String = Reflect.field(selectedPC, "name");
-        // Para machine: envia apenas EXTRAS (que nao estao no Global)
+        // Para machine: envia apenas EXTRAS (que nao estao no Global) + exceptions
         var toSend = blockedHostsList;
+        var exceptions:Array<String> = [];
         if (scope == "machine" && hostGlobalSet != null) {
             var extras:Array<String> = [];
             for (e in blockedHostsList) {
                 if (!hostGlobalSet.exists(e.toLowerCase())) extras.push(e);
             }
             toSend = extras;
+            if (hostExceptions != null) for (k in hostExceptions.keys()) exceptions.push(k);
         }
         var result = runBridge("save-blocked-hosts", {
             sharePath: hostsSharePath(),
             hostname: pcName,
             hosts: toSend,
+            exceptions: exceptions,
             scope: scope
         });
         if (result != null && Reflect.field(result, "status") == "ok") {
             if (hostStatusText != null) {
                 if (scope == "clear") {
-                    hostStatusText.text = "Extras do " + pcName + " removidos - agora so recebe o Global";
+                    hostStatusText.text = "Extras e excecoes do " + pcName + " removidos - agora so recebe o Global";
                     loadBlockedHosts(pcName);
                     renderHostList();
                 } else if (scope == "machine") {
                     var gc = hostGlobalSet != null ? Lambda.count(hostGlobalSet) : 0;
-                    hostStatusText.text = "Salvo extras de " + pcName + ": " + toSend.length + " (soma com " + gc + " do Global). Aplica em ate 60s.";
+                    hostStatusText.text = "Salvo " + pcName + ": " + toSend.length + " extras + " + exceptions.length + " excecoes (Global=" + gc + "). Aplica em ate 60s.";
                     loadBlockedHosts(pcName);
                     renderHostList();
                 } else {

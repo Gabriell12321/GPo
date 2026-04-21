@@ -151,21 +151,31 @@ try {
             $hostname = $args2.hostname
             try {
                 if (-not (Test-Path $sharePath)) {
-                    Write-Result "ok" @{ global = @(); machine = @(); allApps = @() }
+                    Write-Result "ok" @{ global = @(); machine = @(); exceptions = @(); allApps = @() }
                     return
                 }
                 $json = Get-Content $sharePath -Raw | ConvertFrom-Json
                 $global = @()
                 $machine = @()
+                $exceptions = @()
                 $hasMachine = $false
                 if ($json.Global) { $global = @($json.Global) }
                 if ($hostname -and $json.Machines -and $json.Machines.PSObject.Properties[$hostname]) {
                     $machine = @($json.Machines.$hostname)
                     if ($machine.Count -gt 0) { $hasMachine = $true }
                 }
-                # Override: machine NAO-VAZIO manda; senao Global
-                $effective = if ($hasMachine) { $machine } else { $global }
-                Write-Result "ok" @{ global = $global; machine = $machine; allApps = $effective; hasMachine = $hasMachine }
+                if ($hostname -and $json.Exceptions -and $json.Exceptions.PSObject.Properties[$hostname]) {
+                    $exceptions = @($json.Exceptions.$hostname)
+                    if ($exceptions.Count -gt 0) { $hasMachine = $true }
+                }
+                # UNIAO com opt-out: (Global - Exceptions) + Extras (machine), dedup case-insensitive
+                $excSet = @{}
+                foreach ($x in $exceptions) { $excSet["$x".ToLower()] = $true }
+                $effective = @()
+                $seen = @{}
+                foreach ($x in $global)  { $k = "$x".ToLower(); if (-not $excSet.ContainsKey($k) -and -not $seen.ContainsKey($k)) { $effective += $x; $seen[$k] = $true } }
+                foreach ($x in $machine) { $k = "$x".ToLower(); if (-not $seen.ContainsKey($k)) { $effective += $x; $seen[$k] = $true } }
+                Write-Result "ok" @{ global = $global; machine = $machine; exceptions = $exceptions; allApps = $effective; hasMachine = $hasMachine }
             } catch {
                 Write-Result "error" -Message "Erro ao ler: $($_.Exception.Message)"
             }
@@ -174,10 +184,11 @@ try {
         "save-blocked-apps" {
             $sharePath = $args2.sharePath
             $hostname = $args2.hostname
-            $apps = $args2.apps  # array de nomes de processo
-            $scope = $args2.scope  # "global" ou "machine"
+            $apps = $args2.apps  # array de nomes de processo (extras para scope=machine)
+            $exceptionsIn = $args2.exceptions  # array de itens do Global a ignorar neste PC
+            $scope = $args2.scope  # "global" / "machine" / "clear"
             try {
-                $json = @{ Global = @(); Machines = @{} }
+                $json = @{ Global = @(); Machines = @{}; Exceptions = @{} }
                 if (Test-Path $sharePath) {
                     $existing = Get-Content $sharePath -Raw | ConvertFrom-Json
                     if ($existing.Global) { $json.Global = @($existing.Global) }
@@ -186,14 +197,22 @@ try {
                             $json.Machines[$prop.Name] = @($prop.Value)
                         }
                     }
+                    if ($existing.Exceptions) {
+                        foreach ($prop in $existing.Exceptions.PSObject.Properties) {
+                            $json.Exceptions[$prop.Name] = @($prop.Value)
+                        }
+                    }
                 }
                 if ($scope -eq "global") {
                     $json.Global = @($apps)
                 } elseif ($scope -eq "machine" -and $hostname) {
-                    $json.Machines[$hostname] = @($apps)
+                    if ($apps -and @($apps).Count -gt 0) { $json.Machines[$hostname] = @($apps) }
+                    elseif ($json.Machines.ContainsKey($hostname)) { [void]$json.Machines.Remove($hostname) }
+                    if ($exceptionsIn -and @($exceptionsIn).Count -gt 0) { $json.Exceptions[$hostname] = @($exceptionsIn) }
+                    elseif ($json.Exceptions.ContainsKey($hostname)) { [void]$json.Exceptions.Remove($hostname) }
                 } elseif ($scope -eq "clear" -and $hostname) {
-                    # Remove override do PC - passa a herdar Global
                     if ($json.Machines.ContainsKey($hostname)) { [void]$json.Machines.Remove($hostname) }
+                    if ($json.Exceptions.ContainsKey($hostname)) { [void]$json.Exceptions.Remove($hostname) }
                 }
                 $outJson = $json | ConvertTo-Json -Depth 5
                 [System.IO.File]::WriteAllText($sharePath, $outJson, (New-Object System.Text.UTF8Encoding($false)))
@@ -209,22 +228,28 @@ try {
             $hostname  = $args2.hostname
             try {
                 if (-not (Test-Path $sharePath)) {
-                    Write-Result "ok" @{ global = @(); machine = @(); allHosts = @() }
+                    Write-Result "ok" @{ global = @(); machine = @(); exceptions = @(); allHosts = @() }
                     return
                 }
                 $json = Get-Content $sharePath -Raw | ConvertFrom-Json
-                $global = @(); $machine = @(); $hasMachine = $false
+                $global = @(); $machine = @(); $exceptions = @(); $hasMachine = $false
                 if ($json.Global) { $global = @($json.Global) }
                 if ($hostname -and $json.Machines -and $json.Machines.PSObject.Properties[$hostname]) {
                     $machine = @($json.Machines.$hostname)
                     if ($machine.Count -gt 0) { $hasMachine = $true }
                 }
-                # UNIAO: Global + Machine (sem duplicatas)
+                if ($hostname -and $json.Exceptions -and $json.Exceptions.PSObject.Properties[$hostname]) {
+                    $exceptions = @($json.Exceptions.$hostname)
+                    if ($exceptions.Count -gt 0) { $hasMachine = $true }
+                }
+                # UNIAO com opt-out: (Global - Exceptions) + Extras
+                $excSet = @{}
+                foreach ($x in $exceptions) { $excSet["$x".ToLower()] = $true }
                 $effective = @()
                 $seen = @{}
-                foreach ($x in $global)  { $k = "$x".ToLower(); if (-not $seen.ContainsKey($k)) { $effective += $x; $seen[$k] = $true } }
+                foreach ($x in $global)  { $k = "$x".ToLower(); if (-not $excSet.ContainsKey($k) -and -not $seen.ContainsKey($k)) { $effective += $x; $seen[$k] = $true } }
                 foreach ($x in $machine) { $k = "$x".ToLower(); if (-not $seen.ContainsKey($k)) { $effective += $x; $seen[$k] = $true } }
-                Write-Result "ok" @{ global = $global; machine = $machine; allHosts = $effective; hasMachine = $hasMachine }
+                Write-Result "ok" @{ global = $global; machine = $machine; exceptions = $exceptions; allHosts = $effective; hasMachine = $hasMachine }
             } catch {
                 Write-Result "error" -Message "Erro ao ler hosts: $($_.Exception.Message)"
             }
@@ -233,10 +258,11 @@ try {
         "save-blocked-hosts" {
             $sharePath = $args2.sharePath
             $hostname  = $args2.hostname
-            $hosts2    = $args2.hosts   # array de dominios/IPs
-            $scope     = $args2.scope   # "global" ou "machine"
+            $hosts2    = $args2.hosts   # extras para scope=machine
+            $exceptionsIn = $args2.exceptions
+            $scope     = $args2.scope   # "global" / "machine" / "clear"
             try {
-                $json = @{ Global = @(); Machines = @{} }
+                $json = @{ Global = @(); Machines = @{}; Exceptions = @{} }
                 if (Test-Path $sharePath) {
                     $existing = Get-Content $sharePath -Raw | ConvertFrom-Json
                     if ($existing.Global) { $json.Global = @($existing.Global) }
@@ -245,13 +271,22 @@ try {
                             $json.Machines[$prop.Name] = @($prop.Value)
                         }
                     }
+                    if ($existing.Exceptions) {
+                        foreach ($prop in $existing.Exceptions.PSObject.Properties) {
+                            $json.Exceptions[$prop.Name] = @($prop.Value)
+                        }
+                    }
                 }
                 if ($scope -eq "global") {
                     $json.Global = @($hosts2)
                 } elseif ($scope -eq "machine" -and $hostname) {
-                    $json.Machines[$hostname] = @($hosts2)
+                    if ($hosts2 -and @($hosts2).Count -gt 0) { $json.Machines[$hostname] = @($hosts2) }
+                    elseif ($json.Machines.ContainsKey($hostname)) { [void]$json.Machines.Remove($hostname) }
+                    if ($exceptionsIn -and @($exceptionsIn).Count -gt 0) { $json.Exceptions[$hostname] = @($exceptionsIn) }
+                    elseif ($json.Exceptions.ContainsKey($hostname)) { [void]$json.Exceptions.Remove($hostname) }
                 } elseif ($scope -eq "clear" -and $hostname) {
                     if ($json.Machines.ContainsKey($hostname)) { [void]$json.Machines.Remove($hostname) }
+                    if ($json.Exceptions.ContainsKey($hostname)) { [void]$json.Exceptions.Remove($hostname) }
                 }
                 $outJson = $json | ConvertTo-Json -Depth 5
                 # Garante diretorio
@@ -275,7 +310,7 @@ try {
                 }
                 $j = Get-Content $sharePath -Raw | ConvertFrom-Json
                 $global = @{Widgets=$false}
-                $machine = @{}
+                $machine = @{Widgets=$false; WidgetsDisabled=$false}
                 $hasMachine = $false
                 if ($j.Global) {
                     if ($j.Global.PSObject.Properties['Widgets']) { $global.Widgets = [bool]$j.Global.Widgets }
@@ -284,12 +319,13 @@ try {
                     $m = $j.Machines.$hostname
                     if ($m -and $m.PSObject.Properties.Count -gt 0) {
                         if ($m.PSObject.Properties['Widgets']) { $machine.Widgets = [bool]$m.Widgets }
-                        $hasMachine = $true
+                        if ($m.PSObject.Properties['WidgetsDisabled']) { $machine.WidgetsDisabled = [bool]$m.WidgetsDisabled }
+                        if ($machine.Widgets -or $machine.WidgetsDisabled) { $hasMachine = $true }
                     }
                 }
-                # UNIAO para policies (OR logico): qualquer um TRUE = bloqueado
+                # Efetivo: (Global OR Machine.Widgets) AND NOT Machine.WidgetsDisabled
                 $effective = @{
-                    Widgets = ([bool]$global.Widgets) -or ([bool]$machine.Widgets)
+                    Widgets = (([bool]$global.Widgets) -or ([bool]$machine.Widgets)) -and (-not [bool]$machine.WidgetsDisabled)
                 }
                 Write-Result "ok" @{ global = $global; machine = $machine; effective = $effective; hasMachine = $hasMachine }
             } catch {
@@ -312,14 +348,26 @@ try {
                     if ($existing.Machines) {
                         foreach ($prop in $existing.Machines.PSObject.Properties) {
                             $mv = $prop.Value
-                            $json.Machines[$prop.Name] = @{ Widgets = [bool]($mv.Widgets) }
+                            $mc = @{ Widgets = [bool]($mv.Widgets) }
+                            if ($mv.PSObject.Properties['WidgetsDisabled']) { $mc.WidgetsDisabled = [bool]$mv.WidgetsDisabled }
+                            $json.Machines[$prop.Name] = $mc
                         }
                     }
                 }
                 if ($scope -eq "global") {
                     $json.Global = @{ Widgets = $widgets }
                 } elseif ($scope -eq "machine" -and $hostname) {
-                    $json.Machines[$hostname] = @{ Widgets = $widgets }
+                    $gw = [bool]$json.Global.Widgets
+                    if ($widgets -eq $gw) {
+                        # Mesmo estado que Global -> remove override (PC herda)
+                        if ($json.Machines.ContainsKey($hostname)) { [void]$json.Machines.Remove($hostname) }
+                    } elseif ($widgets -and -not $gw) {
+                        # PC quer bloquear mas Global nao bloqueia -> extra (opt-in)
+                        $json.Machines[$hostname] = @{ Widgets = $true; WidgetsDisabled = $false }
+                    } else {
+                        # PC quer liberar mas Global bloqueia -> opt-out
+                        $json.Machines[$hostname] = @{ Widgets = $false; WidgetsDisabled = $true }
+                    }
                 } elseif ($scope -eq "clear" -and $hostname) {
                     if ($json.Machines.ContainsKey($hostname)) { [void]$json.Machines.Remove($hostname) }
                 }
