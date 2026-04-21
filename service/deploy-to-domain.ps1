@@ -1,8 +1,8 @@
-# ══════════════════════════════════════════════════════════════════════
+﻿# ======================================================================
 #  deploy-to-domain.ps1
 #  Roda no srv-105 como Scheduled Task diario.
 #  Enumera todos os computadores ativos do AD e instala o WinSysMon
-#  neles via WinRM (Invoke-Command) — independente de GPO.
+#  neles via WinRM (Invoke-Command) - independente de GPO.
 #
 #  Tambem se registra como scheduled task permanente se chamado com
 #  -SetupTask (uma vez so, como admin do dominio).
@@ -11,17 +11,27 @@
 #    .\deploy-to-domain.ps1 -SetupTask     # cria a task recorrente (1x)
 #    .\deploy-to-domain.ps1                # executa um ciclo agora
 #    .\deploy-to-domain.ps1 -Only PC-12    # so em 1 PC (teste)
-# ══════════════════════════════════════════════════════════════════════
+# ======================================================================
 param(
     [switch]$SetupTask,
     [string]$Only,
-    [string]$ShareInstall = "\\srv-105\Sistema de monitoramento\gpo\aaa\service\install-service.ps1",
+    [string]$ShareInstall = "\\srv-105\aaa$\service\install-service.ps1",
     [int]$ParallelLimit = 10,
     [int]$TimeoutSeconds = 120
 )
 
 $ErrorActionPreference = 'Continue'
 $logFile = Join-Path $PSScriptRoot "deploy-to-domain.log"
+
+# Auto-resolve: se aaa$ nao acessivel, cai pro legado
+$shareFallback = "\\srv-105\Sistema de monitoramento\gpo\aaa\service\install-service.ps1"
+try {
+    if (-not (Test-Path $ShareInstall -ErrorAction Stop)) {
+        if (Test-Path $shareFallback -ErrorAction Stop) { $ShareInstall = $shareFallback }
+    }
+} catch {
+    try { if (Test-Path $shareFallback -ErrorAction Stop) { $ShareInstall = $shareFallback } } catch {}
+}
 
 function Write-L {
     param($m,$lvl="INFO")
@@ -31,9 +41,9 @@ function Write-L {
     try { Add-Content -Path $logFile -Value $line -ErrorAction SilentlyContinue } catch {}
 }
 
-# ──────────────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------------
 #  SETUP: registra como scheduled task diaria
-# ──────────────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------------
 if ($SetupTask) {
     $taskName = "WinSysMonDeploy"
     $scriptPath = $MyInvocation.MyCommand.Path
@@ -50,9 +60,9 @@ if ($SetupTask) {
     exit 0
 }
 
-# ──────────────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------------
 #  1) Listar computadores do AD
-# ──────────────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------------
 Write-L "=== Iniciando ciclo de deploy ==="
 if (-not (Test-Path $ShareInstall)) {
     Write-L "install-service.ps1 nao existe no share: $ShareInstall" "ERROR"
@@ -80,9 +90,9 @@ try {
     exit 1
 }
 
-# ──────────────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------------
 #  2) Scriptblock executado em cada PC
-# ──────────────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------------
 $remote = {
     param($shareInstall)
     $ErrorActionPreference = 'SilentlyContinue'
@@ -117,9 +127,9 @@ $remote = {
     }
 }
 
-# ──────────────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------------
 #  3) Disparar em paralelo (PS 5.1: usa Start-Job)
-# ──────────────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------------
 $results = @()
 $queue   = [System.Collections.Queue]::new()
 foreach ($c in $computers) { $queue.Enqueue($c.Name) }
@@ -131,8 +141,8 @@ function Drain-Finished {
         if ($j.State -in 'Completed','Failed','Stopped') {
             try {
                 $r = Receive-Job -Job $j -ErrorAction SilentlyContinue
-                if ($r) { $script:results += $r; Write-L "  $($r.Host): $($r.Status) — $($r.Detail)" }
-                else    { $script:results += [pscustomobject]@{Host=$name;Status="FAIL";Detail="sem-retorno"}; Write-L "  $name : FAIL — sem-retorno" "WARN" }
+                if ($r) { $script:results += $r; Write-L "  $($r.Host): $($r.Status) - $($r.Detail)" }
+                else    { $script:results += [pscustomobject]@{Host=$name;Status="FAIL";Detail="sem-retorno"}; Write-L "  $name : FAIL - sem-retorno" "WARN" }
             } catch { Write-L "  $name : erro-receive: $($_.Exception.Message)" "WARN" }
             Remove-Job -Job $j -Force -ErrorAction SilentlyContinue
             $jobs.Remove($name)
@@ -161,7 +171,7 @@ while ($queue.Count -gt 0 -or $jobs.Count -gt 0) {
     foreach ($name in @($jobs.Keys)) {
         $j = $jobs[$name]
         if (((Get-Date) - $j.PSBeginTime).TotalSeconds -gt $TimeoutSeconds) {
-            Write-L "  $name : TIMEOUT (${TimeoutSeconds}s) — matando job" "WARN"
+            Write-L "  $name : TIMEOUT (${TimeoutSeconds}s) - matando job" "WARN"
             Stop-Job -Job $j -ErrorAction SilentlyContinue
             $results += [pscustomobject]@{Host=$name;Status="TIMEOUT";Detail="${TimeoutSeconds}s"}
             Remove-Job -Job $j -Force -ErrorAction SilentlyContinue
@@ -170,9 +180,9 @@ while ($queue.Count -gt 0 -or $jobs.Count -gt 0) {
     }
 }
 
-# ──────────────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------------
 #  4) Resumo
-# ──────────────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------------
 $grp = $results | Group-Object Status | Sort-Object Name
 Write-L "=== Resumo ==="
 foreach ($g in $grp) { Write-L "  $($g.Name): $($g.Count)" }

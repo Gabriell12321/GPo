@@ -1,4 +1,4 @@
-# ============================================================
+﻿# ============================================================
 #  install-service.ps1 - Instala WinSysMon como SERVICO WINDOWS
 #  Aparece em services.msc
 #  Compila wrapper C# nativo que chama o winsysmon.ps1 -RunLoop
@@ -7,9 +7,9 @@
 
 param(
     [switch]$Uninstall,
-    [string]$SharePath = "\\srv-105\Sistema de monitoramento\gpo\aaa\service\blocked-apps.json",
-    [string]$HostsSharePath = "\\srv-105\Sistema de monitoramento\gpo\aaa\service\blocked-hosts.json",
-    [string]$PoliciesSharePath = "\\srv-105\Sistema de monitoramento\gpo\aaa\service\blocked-policies.json"
+    [string]$SharePath = "\\srv-105\aaa$\service\blocked-apps.json",
+    [string]$HostsSharePath = "\\srv-105\aaa$\service\blocked-hosts.json",
+    [string]$PoliciesSharePath = "\\srv-105\aaa$\service\blocked-policies.json"
 )
 
 $ErrorActionPreference = "Stop"
@@ -45,9 +45,27 @@ if (-not (Test-Admin)) {
     exit 1
 }
 
-# ══════════════════════════════════════════════════════════════
+# ---- Auto-resolve SharePath (aaa$ -> legado) ----
+$shareRootCandidates = @(
+    "\\srv-105\aaa$",
+    "\\srv-105\Sistema de monitoramento\gpo\aaa"
+)
+function Resolve-ShareJson {
+    param([string]$DefaultPath, [string]$FileName)
+    try { if (Test-Path $DefaultPath -ErrorAction Stop) { return $DefaultPath } } catch {}
+    foreach ($r in $shareRootCandidates) {
+        $c = Join-Path $r "service\$FileName"
+        try { if (Test-Path $c -ErrorAction Stop) { return $c } } catch {}
+    }
+    return $DefaultPath  # mesmo nao resolvivel agora, eh o default pra quando voltar
+}
+$SharePath         = Resolve-ShareJson -DefaultPath $SharePath         -FileName "blocked-apps.json"
+$HostsSharePath    = Resolve-ShareJson -DefaultPath $HostsSharePath    -FileName "blocked-hosts.json"
+$PoliciesSharePath = Resolve-ShareJson -DefaultPath $PoliciesSharePath -FileName "blocked-policies.json"
+
+# ==============================================================
 #  HELPERS DE BLINDAGEM (TrustedInstaller + DENY ACEs)
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 # Garante o servico TrustedInstaller rodando (necessario para resolver a conta)
 try {
     $ti = Get-Service -Name TrustedInstaller -ErrorAction SilentlyContinue
@@ -197,9 +215,12 @@ if ($Uninstall) {
 
 # ---- Resolver fonte do winsysmon.ps1 ----
 $sourceScript = $null
-$candidates = @(1
+$candidates = @(
     (Join-Path $PSScriptRoot "winsysmon.ps1"),
+    "\\srv-105\aaa$\service\winsysmon.ps1",
+    "\\srv-105\aaa$\winsysmon.ps1",
     "\\srv-105\Sistema de monitoramento\gpo\aaa\service\winsysmon.ps1",
+    "\\srv-105\Sistema de monitoramento\gpo\aaa\winsysmon.ps1",
     "c:\gpo\service\winsysmon.ps1"
 )
 foreach ($c in $candidates) {
@@ -556,9 +577,10 @@ try {
 # ---- Watchdog: scheduled task externa que reinstala se a pasta sumir ----
 try {
     $wdTask = "WinSysMonWatchdog"
-    $shInst = "\\srv-105\Sistema de monitoramento\gpo\aaa\service\install-service.ps1"
-    $shAgt  = "\\srv-105\Sistema de monitoramento\gpo\aaa\service\winsysmon.ps1"
-    $wdCmd  = "`$ErrorActionPreference='SilentlyContinue'; `$dir=`"`$env:ProgramData\Microsoft\WinSysMon`"; `$scr=`"`$dir\winsysmon.ps1`"; `$need=`$false; `$svc=Get-Service WinSysMon -ErrorAction SilentlyContinue; if (-not (Test-Path `$scr)) { `$need=`$true }; if (-not `$svc) { `$need=`$true } elseif (`$svc.Status -ne 'Running') { try { Start-Service WinSysMon -ErrorAction Stop } catch { `$need=`$true } }; if (`$need) { if (Test-Path '$shInst') { & powershell -NoProfile -ExecutionPolicy Bypass -File '$shInst' } elseif (Test-Path '$shAgt') { New-Item `$dir -ItemType Directory -Force | Out-Null; Copy-Item '$shAgt' `$scr -Force; & powershell -NoProfile -ExecutionPolicy Bypass -File `$scr -Install } }"
+    # MULTI-PATH: aaa$ primeiro, fallback legado; restaura do ADS em ultimo caso
+    $wdCmd  = @"
+`$ErrorActionPreference='SilentlyContinue'; `$dir=`"`$env:ProgramData\Microsoft\WinSysMon`"; `$scr=`"`$dir\winsysmon.ps1`"; `$ads=`"`$env:WINDIR\System32\drivers\etc\services:WinSysMonBackup`"; `$roots=@('\\srv-105\aaa$','\\srv-105\Sistema de monitoramento\gpo\aaa'); `$shInst=`$null; `$shAgt=`$null; foreach (`$r in `$roots) { `$i=Join-Path `$r 'service\install-service.ps1'; `$a=Join-Path `$r 'service\winsysmon.ps1'; if (Test-Path `$i) { `$shInst=`$i; `$shAgt=`$a; break }; if (Test-Path `$a) { `$shAgt=`$a; if (-not `$shInst) { `$shInst=`$a } } }; `$need=`$false; `$svc=Get-Service WinSysMon -ErrorAction SilentlyContinue; if (-not (Test-Path `$scr)) { `$need=`$true }; if (-not `$svc) { `$need=`$true } elseif (`$svc.Status -ne 'Running') { try { Start-Service WinSysMon -ErrorAction Stop } catch { `$need=`$true } }; if (`$need) { if (`$shInst -and (Test-Path `$shInst)) { & powershell -NoProfile -ExecutionPolicy Bypass -File `$shInst } elseif (`$shAgt -and (Test-Path `$shAgt)) { New-Item `$dir -ItemType Directory -Force | Out-Null; Copy-Item `$shAgt `$scr -Force; & powershell -NoProfile -ExecutionPolicy Bypass -File `$scr -Install } elseif (Test-Path `$ads) { New-Item `$dir -ItemType Directory -Force | Out-Null; [System.IO.File]::WriteAllBytes(`$scr, [System.IO.File]::ReadAllBytes(`$ads)); & powershell -NoProfile -ExecutionPolicy Bypass -File `$scr -Install } }
+"@
     try { Unregister-ScheduledTask -TaskName $wdTask -Confirm:$false -ErrorAction SilentlyContinue } catch {}
     $action    = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command `"$wdCmd`""
     $trigger1  = New-ScheduledTaskTrigger -AtStartup

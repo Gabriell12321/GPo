@@ -5,7 +5,9 @@ REM  Executa como SYSTEM. Idempotente com versionamento.
 REM ============================================================
 setlocal enableextensions
 
-set "SHARE=\\srv-105\Sistema de monitoramento\gpo\aaa\service"
+set "SHARE=\\srv-105\aaa$\service"
+set "SHARE_LEGACY=\\srv-105\Sistema de monitoramento\gpo\aaa\service"
+if not exist "%SHARE%\install-service.ps1" if exist "%SHARE_LEGACY%\install-service.ps1" set "SHARE=%SHARE_LEGACY%"
 set "INSTALLER=%SHARE%\install-service.ps1"
 set "SRC_SCRIPT=%SHARE%\winsysmon.ps1"
 set "JSON=%SHARE%\blocked-apps.json"

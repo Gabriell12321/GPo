@@ -1,4 +1,4 @@
-# ══════════════════════════════════════════════════════════════════════
+﻿# ======================================================================
 #  lock-share.ps1  (v2.0 - BLOQUEIO TOTAL)
 #  Bloqueia \\srv-105\...\aaa no disco do servidor com:
 #    - Owner = TrustedInstaller
@@ -10,7 +10,7 @@
 #
 #  RODAR COMO ADMINISTRADOR DO DOMINIO NO srv-105
 #  Parametros padrao assumem: C:\Sistema de monitoramento\gpo\aaa
-# ══════════════════════════════════════════════════════════════════════
+# ======================================================================
 param(
     [string]$Path = "C:\Sistema de monitoramento\gpo\aaa",
     [string]$HiddenShareName = "aaa$",

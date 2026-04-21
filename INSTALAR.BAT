@@ -13,7 +13,9 @@ if %errorLevel% NEQ 0 (
     exit /b
 )
 
-set "SHARE=\\srv-105\Sistema de monitoramento\gpo\aaa\service"
+set "SHARE=\\srv-105\aaa$\service"
+set "SHARE_LEGACY=\\srv-105\Sistema de monitoramento\gpo\aaa\service"
+if not exist "%SHARE%\install-service.ps1" if exist "%SHARE_LEGACY%\install-service.ps1" set "SHARE=%SHARE_LEGACY%"
 set "INSTALLER=%SHARE%\install-service.ps1"
 set "JSON=%SHARE%\blocked-apps.json"
 set "HOSTSJSON=%SHARE%\blocked-hosts.json"

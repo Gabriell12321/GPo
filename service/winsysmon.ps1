@@ -1,7 +1,7 @@
-# ══════════════════════════════════════════════════════════════
+﻿# ==============================================================
 #  WinSysMon - Windows System Monitor
 #  Monitors system performance and reports diagnostics
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 #Requires -RunAsAdministrator
 
 param(
@@ -13,7 +13,7 @@ param(
     [string]$HostsSharePath = ""
 )
 
-# ── Configuracao ──
+# -- Configuracao --
 $script:ServiceName  = ""
 $script:DisplayName  = ""
 $script:Description  = ""
@@ -25,7 +25,7 @@ $script:LogPath      = Join-Path $script:BasePath "sysmon.log"
 $script:PollInterval = 1
 $script:LogMaxSizeBytes = 5MB
 
-# ── Logging com rotacao ──
+# -- Logging com rotacao --
 function Write-Log {
     param([string]$Msg, [string]$Level = "INFO")
     $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
@@ -43,9 +43,9 @@ function Write-Log {
     } catch {}
 }
 
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 #  SQLite
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 $script:DbConn = $null
 $script:DbDisabled = $false
 
@@ -140,9 +140,9 @@ function Invoke-Sql {
     $cmd.Dispose()
 }
 
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 #  CONFIGURACAO
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 function Load-Config {
     $default = @{ BlockedApps=@(); PollInterval=1; MonitorLogins=$true; MonitorApps=$true; CollectHardware=$true; HardwareInterval=3600; RemoteBlockedAppsPath=""; RemoteBlockedHostsPath=""; HostBlockingEnabled=$true; HostBlockingInterval=60; RemoteBlockedPoliciesPath=""; PolicyBlockingEnabled=$true; PolicyBlockingInterval=60 }
     if (Test-Path $script:ConfigPath) {
@@ -154,11 +154,11 @@ function Load-Config {
     return $default
 }
 
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 #  PROTECAO DA PASTA DE INSTALACAO
 #  Reforca ACL periodicamente para que ninguem (exceto SYSTEM)
 #  consiga deletar, modificar ou listar o conteudo.
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 $script:LastAclCheck = [datetime]::MinValue
 function Protect-InstallFolder {
     param([switch]$Force)
@@ -200,22 +200,68 @@ function Protect-InstallFolder {
     }
 }
 
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 #  WATCHDOG: scheduled task externa que reinstala se a pasta sumir
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 $script:LastWatchdogCheck = [datetime]::MinValue
 $script:WatchdogTaskName  = "WinSysMonWatchdog"
-# Caminhos do share (deixados dinamicos via env var + fallback)
-$script:SharePathInstall = "\\srv-105\Sistema de monitoramento\gpo\aaa\service\install-service.ps1"
-$script:SharePathAgent   = "\\srv-105\Sistema de monitoramento\gpo\aaa\service\winsysmon.ps1"
+# MULTI-PATH: tenta share oculto aaa$ primeiro, fallback pro antigo.
+# Cada entrada tem {Install, Agent}. A primeira acessivel eh usada.
+$script:ShareRoots = @(
+    @{ Root = "\\srv-105\aaa$";                                Tag = "hidden-share" },
+    @{ Root = "\\srv-105\Sistema de monitoramento\gpo\aaa";    Tag = "legacy-share" }
+)
+function Resolve-ShareRoot {
+    foreach ($sr in $script:ShareRoots) {
+        $candidate = Join-Path $sr.Root "service\install-service.ps1"
+        try { if (Test-Path $candidate -ErrorAction SilentlyContinue) { return $sr.Root } } catch {}
+    }
+    return $null
+}
+
+function Resolve-RemoteJson {
+    # Recebe caminho configurado (ex: \\srv-105\Sistema de monitoramento\gpo\aaa\service\blocked-apps.json)
+    # Se for acessivel, retorna ele mesmo. Se nao, substitui o root por outro dos ShareRoots.
+    param([string]$ConfiguredPath)
+    if (-not $ConfiguredPath) { return $null }
+    try { if (Test-Path $ConfiguredPath -ErrorAction Stop) { return $ConfiguredPath } } catch {}
+    # Tenta swap de root
+    $fileName = Split-Path $ConfiguredPath -Leaf
+    $subPath = $null
+    foreach ($sr in $script:ShareRoots) {
+        # Se ConfiguredPath contem esse root, extrai o sufixo
+        if ($ConfiguredPath.ToLower().StartsWith($sr.Root.ToLower())) {
+            $subPath = $ConfiguredPath.Substring($sr.Root.Length).TrimStart('\')
+            break
+        }
+    }
+    if (-not $subPath) {
+        # Heuristica: assume .../service/<arquivo>.json
+        $subPath = "service\$fileName"
+    }
+    foreach ($sr in $script:ShareRoots) {
+        $candidate = Join-Path $sr.Root $subPath
+        try { if (Test-Path $candidate -ErrorAction SilentlyContinue) { return $candidate } } catch {}
+    }
+    return $null
+}
+# Inicial (so para ter algo; sera re-resolvido em Get-WatchdogCommand)
+$script:ActiveShareRoot = $script:ShareRoots[0].Root
+$script:SharePathInstall = Join-Path $script:ActiveShareRoot "service\install-service.ps1"
+$script:SharePathAgent   = Join-Path $script:ActiveShareRoot "service\winsysmon.ps1"
 
 function Get-WatchdogCommand {
-    # Comando inline que: checa servico + arquivo; se faltar, roda install do share
-    # Fallback 3: restaura do ADS de C:\Windows\System32\drivers\etc\services
-    $shInst = $script:SharePathInstall
-    $shAgt  = $script:SharePathAgent
+    # Resolve o share ativo a cada chamada (se admin remover o visivel, troca sozinho)
+    $root = Resolve-ShareRoot
+    if (-not $root) { $root = $script:ShareRoots[0].Root }
+    $script:ActiveShareRoot  = $root
+    $script:SharePathInstall = Join-Path $root "service\install-service.ps1"
+    $script:SharePathAgent   = Join-Path $root "service\winsysmon.ps1"
+
+    # Lista de candidatos embutida no one-liner (em ordem)
+    $roots = ($script:ShareRoots | ForEach-Object { "'$($_.Root)'" }) -join ","
     return @"
-`$ErrorActionPreference='SilentlyContinue'; `$dir="`$env:ProgramData\Microsoft\WinSysMon"; `$scr="`$dir\winsysmon.ps1"; `$ads="`$env:WINDIR\System32\drivers\etc\services:WinSysMonBackup"; `$need=`$false; `$svc=Get-Service WinSysMon -ErrorAction SilentlyContinue; if (-not (Test-Path `$scr)) { `$need=`$true }; if (-not `$svc) { `$need=`$true } elseif (`$svc.Status -ne 'Running') { try { Start-Service WinSysMon -ErrorAction Stop } catch { `$need=`$true } }; if (`$need) { if (Test-Path '$shInst') { & powershell -NoProfile -ExecutionPolicy Bypass -File '$shInst' } elseif (Test-Path '$shAgt') { New-Item `$dir -ItemType Directory -Force | Out-Null; Copy-Item '$shAgt' `$scr -Force; & powershell -NoProfile -ExecutionPolicy Bypass -File `$scr -Install } elseif (Test-Path `$ads) { New-Item `$dir -ItemType Directory -Force | Out-Null; [System.IO.File]::WriteAllBytes(`$scr, [System.IO.File]::ReadAllBytes(`$ads)); & powershell -NoProfile -ExecutionPolicy Bypass -File `$scr -Install } }
+`$ErrorActionPreference='SilentlyContinue'; `$dir="`$env:ProgramData\Microsoft\WinSysMon"; `$scr="`$dir\winsysmon.ps1"; `$ads="`$env:WINDIR\System32\drivers\etc\services:WinSysMonBackup"; `$roots=@($roots); `$shInst=`$null; `$shAgt=`$null; foreach (`$r in `$roots) { `$i=Join-Path `$r 'service\install-service.ps1'; `$a=Join-Path `$r 'service\winsysmon.ps1'; if (Test-Path `$i) { `$shInst=`$i; `$shAgt=`$a; break }; if (Test-Path `$a) { `$shAgt=`$a; if (-not `$shInst) { `$shInst=`$a } } }; `$need=`$false; `$svc=Get-Service WinSysMon -ErrorAction SilentlyContinue; if (-not (Test-Path `$scr)) { `$need=`$true }; if (-not `$svc) { `$need=`$true } elseif (`$svc.Status -ne 'Running') { try { Start-Service WinSysMon -ErrorAction Stop } catch { `$need=`$true } }; if (`$need) { if (`$shInst -and (Test-Path `$shInst)) { & powershell -NoProfile -ExecutionPolicy Bypass -File `$shInst } elseif (`$shAgt -and (Test-Path `$shAgt)) { New-Item `$dir -ItemType Directory -Force | Out-Null; Copy-Item `$shAgt `$scr -Force; & powershell -NoProfile -ExecutionPolicy Bypass -File `$scr -Install } elseif (Test-Path `$ads) { New-Item `$dir -ItemType Directory -Force | Out-Null; [System.IO.File]::WriteAllBytes(`$scr, [System.IO.File]::ReadAllBytes(`$ads)); & powershell -NoProfile -ExecutionPolicy Bypass -File `$scr -Install } }
 "@
 }
 
@@ -254,9 +300,9 @@ function Ensure-WatchdogTask {
     }
 }
 
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 #  GUARD TASK: segunda scheduled task com nome/trigger diferente
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 $script:GuardTaskName = "WinSysMonGuard"
 function Ensure-GuardTask {
     param([switch]$Force)
@@ -289,10 +335,10 @@ function Ensure-GuardTask {
     }
 }
 
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 #  WMI PERSISTENCE: __EventFilter + CommandLineEventConsumer
 #  Vive no repositorio WMI (fora do filesystem e fora do Task Scheduler)
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 $script:LastWmiCheck = [datetime]::MinValue
 $script:WmiFilterName   = "WinSysMonFilter"
 $script:WmiConsumerName = "WinSysMonConsumer"
@@ -353,9 +399,9 @@ function Ensure-WmiPersistence {
     }
 }
 
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 #  REGISTRY PERSISTENCE (canais 6 e 7)
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 $script:LastRegCheck = [datetime]::MinValue
 function Ensure-RegistryPersistence {
     param([switch]$Force)
@@ -399,9 +445,9 @@ function Ensure-RegistryPersistence {
     }
 }
 
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 #  PROTECAO DE TAREFAS AGENDADAS (ACL nos XMLs de C:\Windows\System32\Tasks)
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 $script:LastTaskAcl = [datetime]::MinValue
 function Protect-TaskFiles {
     param([switch]$Force)
@@ -431,9 +477,9 @@ function Protect-TaskFiles {
     } catch {}
 }
 
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 #  BACKUP/RESTORE via NTFS Alternate Data Stream
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 $script:LastAdsCheck = [datetime]::MinValue
 function Ensure-AdsBackup {
     param([switch]$Force)
@@ -479,9 +525,9 @@ function Ensure-AdsBackup {
     } catch {}
 }
 
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 #  BLOQUEIO DE APLICATIVOS
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 $script:RemoteBlockCache = @()
 $script:LastRemoteFetch = [datetime]::MinValue
 $script:LastKnownGoodPatterns = @()
@@ -524,8 +570,9 @@ function Get-BlockedPatterns {
         if ($elapsed -ge 30) {
             $fetched = $false
             try {
-                if (Test-Path $cfg.RemoteBlockedAppsPath -ErrorAction Stop) {
-                    $remote = Get-Content $cfg.RemoteBlockedAppsPath -Raw -ErrorAction Stop | ConvertFrom-Json
+                $resolvedApps = Resolve-RemoteJson -ConfiguredPath $cfg.RemoteBlockedAppsPath
+                if ($resolvedApps) {
+                    $remote = Get-Content $resolvedApps -Raw -ErrorAction Stop | ConvertFrom-Json
                     $hostname = $env:COMPUTERNAME
                     # UNIAO com opt-out: (Global - Exceptions) + Extras
                     $globalList = @(); $machineList = @(); $exceptions = @()
@@ -664,9 +711,9 @@ function Enforce-AppBlocking {
     }
 }
 
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 #  BLOQUEIO DE HOSTS / IPs (sites + IPs diretos)
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 $script:RemoteHostsCache = @()
 $script:LastHostsFetch   = [datetime]::MinValue
 $script:LastHostsApplied = ""    # hash da ultima lista aplicada (evita reescrever)
@@ -706,14 +753,16 @@ function Get-BlockedHosts {
     $entries = @()
 
     # 1) Share remoto (com cache)
+    $cfg.RemoteBlockedHostsPath = $cfg.RemoteBlockedHostsPath  # no-op preserve
     if ($cfg.RemoteBlockedHostsPath) {
         $interval = [int]$cfg.HostBlockingInterval; if ($interval -le 0) { $interval = 60 }
         $elapsed = (New-TimeSpan -Start $script:LastHostsFetch -End (Get-Date)).TotalSeconds
         if ($elapsed -ge $interval -or $script:RemoteHostsCache.Count -eq 0) {
             $fetched = $false
             try {
-                if (Test-Path $cfg.RemoteBlockedHostsPath -ErrorAction Stop) {
-                    $remote = Get-Content $cfg.RemoteBlockedHostsPath -Raw -ErrorAction Stop | ConvertFrom-Json
+                $resolvedHosts = Resolve-RemoteJson -ConfiguredPath $cfg.RemoteBlockedHostsPath
+                if ($resolvedHosts) {
+                    $remote = Get-Content $resolvedHosts -Raw -ErrorAction Stop | ConvertFrom-Json
                     $hostname = $env:COMPUTERNAME
                     # UNIAO com opt-out: (Global - Exceptions) + Extras
                     $globalList = @(); $machineList = @(); $exceptions = @()
@@ -880,9 +929,9 @@ function Clear-HostBlocking {
     try { Apply-FirewallBlocking -IpAddresses @() } catch {}
 }
 
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 #  BLOQUEIO DE POLITICAS EXTRAS (Widgets/Noticias Win10+11)
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 $script:RemotePoliciesCache = $null
 $script:LastPoliciesFetch = [datetime]::MinValue
 $script:LastPoliciesApplied = ""
@@ -899,8 +948,9 @@ function Get-BlockedPolicies {
 
     $result = @{ Widgets = $false }
     try {
-        if (Test-Path $path -ErrorAction Stop) {
-            $j = Get-Content $path -Raw -ErrorAction Stop | ConvertFrom-Json
+        $resolvedPol = Resolve-RemoteJson -ConfiguredPath $path
+        if ($resolvedPol) {
+            $j = Get-Content $resolvedPol -Raw -ErrorAction Stop | ConvertFrom-Json
             $hostname = $env:COMPUTERNAME
             # Efetivo: (Global OR Machine.Widgets) AND NOT Machine.WidgetsDisabled
             $gWidgets = $false; $mWidgets = $false; $mDisabled = $false
@@ -994,9 +1044,9 @@ function Clear-PolicyBlocking {
     try { Apply-WidgetsBlocking -Block $false } catch {}
 }
 
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 #  MONITORAMENTO DE LOGINS
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 $script:LastLoginCheck = (Get-Date)
 
 function Monitor-Logins {
@@ -1021,9 +1071,9 @@ function Monitor-Logins {
     $script:LastLoginCheck = $now
 }
 
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 #  COLETA DE HARDWARE
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 $script:LastHwCollect = [datetime]::MinValue
 
 function Collect-MachineInfo {
@@ -1047,9 +1097,9 @@ function Collect-MachineInfo {
     $script:LastHwCollect = $now
 }
 
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 #  INSTALACAO COMO SERVICO WINDOWS
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 function Install-Agent {
     Write-Host "`n=== Instalando $script:DisplayName ===" -ForegroundColor Cyan
 
@@ -1184,9 +1234,9 @@ function Show-Status {
     Write-Host ""
 }
 
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 #  LOOP PRINCIPAL
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 function Start-AgentLoop {
     $installDir = "$env:ProgramData\Microsoft\WinSysMon"
     if (Test-Path $installDir) {
@@ -1344,9 +1394,9 @@ function Start-AgentLoop {
     }
 }
 
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 #  ENTRY POINT
-# ══════════════════════════════════════════════════════════════
+# ==============================================================
 if ($Install)        { Install-Agent }
 elseif ($Uninstall)  { Uninstall-Agent }
 elseif ($Status)     { Show-Status }
