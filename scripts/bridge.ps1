@@ -219,7 +219,11 @@ try {
                     $machine = @($json.Machines.$hostname)
                     if ($machine.Count -gt 0) { $hasMachine = $true }
                 }
-                $effective = if ($hasMachine) { $machine } else { $global }
+                # UNIAO: Global + Machine (sem duplicatas)
+                $effective = @()
+                $seen = @{}
+                foreach ($x in $global)  { $k = "$x".ToLower(); if (-not $seen.ContainsKey($k)) { $effective += $x; $seen[$k] = $true } }
+                foreach ($x in $machine) { $k = "$x".ToLower(); if (-not $seen.ContainsKey($k)) { $effective += $x; $seen[$k] = $true } }
                 Write-Result "ok" @{ global = $global; machine = $machine; allHosts = $effective; hasMachine = $hasMachine }
             } catch {
                 Write-Result "error" -Message "Erro ao ler hosts: $($_.Exception.Message)"
@@ -283,8 +287,10 @@ try {
                         $hasMachine = $true
                     }
                 }
-                $effective = if ($hasMachine) { $machine } else { $global }
-                if (-not $effective.PSObject.Properties['Widgets'] -and -not $effective.ContainsKey('Widgets')) { $effective.Widgets = $false }
+                # UNIAO para policies (OR logico): qualquer um TRUE = bloqueado
+                $effective = @{
+                    Widgets = ([bool]$global.Widgets) -or ([bool]$machine.Widgets)
+                }
                 Write-Result "ok" @{ global = $global; machine = $machine; effective = $effective; hasMachine = $hasMachine }
             } catch {
                 Write-Result "error" -Message "Erro ao ler policies: $($_.Exception.Message)"

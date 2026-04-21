@@ -55,6 +55,7 @@ class Main extends hxd.App {
     var appScrollY:Float = 0;
     var blockedApps:Array<String> = [];
     var appCheckStates:Map<String, Bool>;
+    var appGlobalSet:Map<String, Bool>;  // apps que estao no Global (para marcar visualmente)
     var appSearchStr:String = "";
     var appSearchDisplay:Text;
     var appSearchBorder:Graphics;
@@ -70,6 +71,7 @@ class Main extends hxd.App {
     var hostInputBorder:Graphics;
     var editingHostInput:Bool = false;
     var hostStatusText:Text;
+    var hostGlobalSet:Map<String, Bool>;  // entradas que vem do Global
 
     // Politicas Extras (Widgets/Noticias)
     var policyLayer:h2d.Object;
@@ -559,6 +561,18 @@ class Main extends hxd.App {
             var status:String = Reflect.field(result, "status");
             if (status == "ok") {
                 var data:Dynamic = Reflect.field(result, "data");
+                // Popula Global set (para diff ao salvar por PC)
+                appGlobalSet = new Map();
+                var globalArr:Dynamic = Reflect.field(data, "global");
+                if (globalArr != null) {
+                    if (Std.isOfType(globalArr, Array)) {
+                        var arr:Array<Dynamic> = cast globalArr;
+                        for (item in arr) appGlobalSet.set(Std.string(item).toLowerCase(), true);
+                    } else {
+                        var s = Std.string(globalArr).toLowerCase();
+                        if (s.length > 0) appGlobalSet.set(s, true);
+                    }
+                }
                 var allApps:Dynamic = Reflect.field(data, "allApps");
                 if (allApps != null) {
                     if (Std.isOfType(allApps, Array)) {
@@ -615,6 +629,7 @@ class Main extends hxd.App {
             }
 
             var isBlocked = appCheckStates.exists(procName) && appCheckStates.get(procName);
+            var isGlobal = appGlobalSet != null && appGlobalSet.exists(procName);
             var rowColor:Int = isBlocked ? 0x45283C : ((i % 2 == 0) ? 0x313244 : 0x1E1E2E);
 
             var row = new Graphics(appLayer);
@@ -625,7 +640,7 @@ class Main extends hxd.App {
             chk.lineStyle(1, 0x6C7086);
             chk.drawRect(12, y + 3, 14, 14);
             if (isBlocked) {
-                chk.beginFill(0xF38BA8);
+                chk.beginFill(isGlobal ? 0x89B4FA : 0xF38BA8);
                 chk.drawRect(14, y + 5, 10, 10);
                 chk.endFill();
             }
@@ -633,6 +648,7 @@ class Main extends hxd.App {
             addLayerText(appLayer, displayName, 40, y + 3, 1.0, isBlocked ? 0xF38BA8 : 0xCDD6F4);
             addLayerText(appLayer, procName, 300, y + 3, 1.0, 0x6C7086);
             addLayerText(appLayer, category, 480, y + 3, 1.0, 0x585B70);
+            if (isGlobal) addLayerText(appLayer, "G", Std.int(w) - 30, y + 3, 1.1, 0x89B4FA);
 
             // Click
             var area2 = new Interactive(w, 20, appLayer);
@@ -657,6 +673,15 @@ class Main extends hxd.App {
                 apps.push(app[0]);
             }
         }
+        // Para scope=machine: salva APENAS os extras (itens que NAO estao no Global)
+        // Assim editar PC nao polui o JSON com copias do Global
+        if (scope == "machine" && appGlobalSet != null) {
+            var extras:Array<String> = [];
+            for (a in apps) {
+                if (!appGlobalSet.exists(a.toLowerCase())) extras.push(a);
+            }
+            apps = extras;
+        }
         var result = runBridge("save-blocked-apps", {
             sharePath: sharePath,
             hostname: pcName,
@@ -664,14 +689,19 @@ class Main extends hxd.App {
             scope: scope
         });
         if (result != null && Reflect.field(result, "status") == "ok") {
-            var label = switch (scope) { case "global": "GLOBAL"; case "clear": "HERDANDO GLOBAL"; default: pcName; };
+            var label = switch (scope) { case "global": "GLOBAL"; case "clear": "SEM EXTRAS (so Global)"; default: pcName + " (extras)"; };
             if (scope == "clear") {
-                appStatusText.text = "Override removido - " + pcName + " agora usa lista GLOBAL";
-                // Recarrega para mostrar o que veio do global
+                appStatusText.text = "Extras do " + pcName + " removidos - agora so recebe o Global";
+                loadCurrentBlocks(pcName);
+                renderAppList();
+            } else if (scope == "machine") {
+                appStatusText.text = "Salvo extras de " + pcName + ": " + apps.length + " apps (soma com " + (appGlobalSet != null ? Lambda.count(appGlobalSet) : 0) + " do Global)";
                 loadCurrentBlocks(pcName);
                 renderAppList();
             } else {
-                appStatusText.text = "Salvo (" + label + "): " + apps.length + " apps bloqueados";
+                appStatusText.text = "Salvo GLOBAL: " + apps.length + " apps (aplica a TODOS os PCs)";
+                loadCurrentBlocks(pcName);
+                renderAppList();
             }
             appStatusText.textColor = 0xA6E3A1;
         } else {
@@ -818,16 +848,26 @@ class Main extends hxd.App {
 
     function loadBlockedHosts(pcName:String) {
         blockedHostsList = [];
+        hostGlobalSet = new Map();
         var result = runBridge("get-blocked-hosts", {sharePath: hostsSharePath(), hostname: pcName});
         if (result != null && Reflect.field(result, "status") == "ok") {
             var data:Dynamic = Reflect.field(result, "data");
+            var globalArr:Dynamic = Reflect.field(data, "global");
+            if (globalArr != null) {
+                if (Std.isOfType(globalArr, Array)) {
+                    var arr:Array<Dynamic> = cast globalArr;
+                    for (item in arr) hostGlobalSet.set(Std.string(item).toLowerCase(), true);
+                } else {
+                    var s = Std.string(globalArr).toLowerCase();
+                    if (s.length > 0) hostGlobalSet.set(s, true);
+                }
+            }
             var all:Dynamic = Reflect.field(data, "allHosts");
             if (all != null) {
                 if (Std.isOfType(all, Array)) {
                     var arr:Array<Dynamic> = cast all;
                     for (item in arr) blockedHostsList.push(Std.string(item));
                 } else {
-                    // ConvertTo-Json colapsa array de 1 elemento em escalar
                     var s = Std.string(all);
                     if (s.length > 0) blockedHostsList.push(s);
                 }
@@ -857,8 +897,10 @@ class Main extends hxd.App {
         for (i in 0...blockedHostsList.length) {
             var entry = blockedHostsList[i];
             var isIp = isIpLike(entry);
-            var tipo = isIp ? "IP (firewall)" : "Site (hosts)";
-            var tipoColor = isIp ? 0xFAB387 : 0x89DCEB;
+            var isGlobal = hostGlobalSet != null && hostGlobalSet.exists(entry.toLowerCase());
+            var tipoBase = isIp ? "IP (firewall)" : "Site (hosts)";
+            var tipo = isGlobal ? (tipoBase + " [G]") : (tipoBase + " [PC]");
+            var tipoColor = isGlobal ? 0x89B4FA : (isIp ? 0xFAB387 : 0x89DCEB);
             var rowColor:Int = (i % 2 == 0) ? 0x313244 : 0x1E1E2E;
 
             var row = new Graphics(hostLayer);
@@ -874,7 +916,14 @@ class Main extends hxd.App {
             var area = new Interactive(80, 18, hostLayer);
             area.x = Std.int(w) - 90; area.y = y + 2; area.cursor = Button;
             var idx = i;
+            var entryCopy = entry;
+            var entryIsGlobal = isGlobal;
             area.onClick = function(_) {
+                if (entryIsGlobal && hostStatusText != null) {
+                    hostStatusText.text = "'" + entryCopy + "' vem do GLOBAL - va em outro PC e use 'Salvar Global' para tirar da lista geral";
+                    hostStatusText.textColor = 0xF9E2AF;
+                    return;
+                }
                 blockedHostsList.splice(idx, 1);
                 renderHostList();
             };
@@ -908,21 +957,36 @@ class Main extends hxd.App {
 
     function saveHosts(scope:String) {
         var pcName:String = Reflect.field(selectedPC, "name");
+        // Para machine: envia apenas EXTRAS (que nao estao no Global)
+        var toSend = blockedHostsList;
+        if (scope == "machine" && hostGlobalSet != null) {
+            var extras:Array<String> = [];
+            for (e in blockedHostsList) {
+                if (!hostGlobalSet.exists(e.toLowerCase())) extras.push(e);
+            }
+            toSend = extras;
+        }
         var result = runBridge("save-blocked-hosts", {
             sharePath: hostsSharePath(),
             hostname: pcName,
-            hosts: blockedHostsList,
+            hosts: toSend,
             scope: scope
         });
         if (result != null && Reflect.field(result, "status") == "ok") {
-            var label = switch (scope) { case "global": "GLOBAL"; case "clear": "HERDANDO GLOBAL"; default: pcName; };
             if (hostStatusText != null) {
                 if (scope == "clear") {
-                    hostStatusText.text = "Override removido - " + pcName + " agora usa lista GLOBAL";
+                    hostStatusText.text = "Extras do " + pcName + " removidos - agora so recebe o Global";
+                    loadBlockedHosts(pcName);
+                    renderHostList();
+                } else if (scope == "machine") {
+                    var gc = hostGlobalSet != null ? Lambda.count(hostGlobalSet) : 0;
+                    hostStatusText.text = "Salvo extras de " + pcName + ": " + toSend.length + " (soma com " + gc + " do Global). Aplica em ate 60s.";
                     loadBlockedHosts(pcName);
                     renderHostList();
                 } else {
-                    hostStatusText.text = "Salvo (" + label + "): " + blockedHostsList.length + " entradas (aplica em ate 60s nos PCs)";
+                    hostStatusText.text = "Salvo GLOBAL: " + toSend.length + " entradas (aplica em TODOS os PCs)";
+                    loadBlockedHosts(pcName);
+                    renderHostList();
                 }
                 hostStatusText.textColor = 0xA6E3A1;
             }
@@ -1025,7 +1089,7 @@ class Main extends hxd.App {
         addLayerText(policyLayer, "- Remove o icone de Widgets (Win11) e News and Interests (Win10)", 10, y + 22, 1.0, 0xCDD6F4);
         addLayerText(policyLayer, "- Aplica Registry.pol + mata processos Widgets.exe / WidgetService.exe", 10, y + 36, 1.0, 0xCDD6F4);
 
-        var scopeLabel = policyHasMachine ? "Override PC" : "Herda Global";
+        var scopeLabel = policyHasMachine ? "Global + PC" : "So Global";
         var scopeColor = policyHasMachine ? 0xFAB387 : 0x89DCEB;
         addLayerText(policyLayer, scopeLabel, Std.int(w) - 320, y + 18, 1.1, scopeColor);
 

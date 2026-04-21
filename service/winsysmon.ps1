@@ -202,23 +202,24 @@ function Get-BlockedPatterns {
                 if (Test-Path $cfg.RemoteBlockedAppsPath -ErrorAction Stop) {
                     $remote = Get-Content $cfg.RemoteBlockedAppsPath -Raw -ErrorAction Stop | ConvertFrom-Json
                     $hostname = $env:COMPUTERNAME
-                    $newCache = @()
-                    # OVERRIDE: se PC tem entrada especifica NAO-VAZIA, usa SOMENTE ela; senao usa Global
+                    # UNIAO: Global + Machine (sem duplicatas)
+                    $globalList = @(); $machineList = @()
+                    if ($remote.Global) { $globalList = @($remote.Global) }
                     $hasMachine = $false
                     if ($remote.Machines -and $remote.Machines.PSObject.Properties[$hostname]) {
-                        $machineList = @($remote.Machines.$hostname)
-                        if ($machineList.Count -gt 0) {
-                            $newCache = $machineList
-                            $hasMachine = $true
-                        }
+                        $mList = @($remote.Machines.$hostname)
+                        if ($mList.Count -gt 0) { $machineList = $mList; $hasMachine = $true }
                     }
-                    if (-not $hasMachine -and $remote.Global) { $newCache = @($remote.Global) }
+                    $newCache = @()
+                    $seen = @{}
+                    foreach ($x in $globalList)  { $k = "$x".ToLower(); if (-not $seen.ContainsKey($k)) { $newCache += $x; $seen[$k] = $true } }
+                    foreach ($x in $machineList) { $k = "$x".ToLower(); if (-not $seen.ContainsKey($k)) { $newCache += $x; $seen[$k] = $true } }
                     $script:RemoteBlockCache = $newCache
                     $script:LastRemoteFetch = Get-Date
                     $fetched = $true
                     Save-PatternsCache -Patterns $newCache
-                    $src = if ($hasMachine) { "machine" } else { "global" }
-                    Write-Log "Remote blocked apps ($src): $($newCache.Count) patterns"
+                    $src = if ($hasMachine) { "global+machine" } else { "global" }
+                    Write-Log "Remote blocked apps ($src): $($newCache.Count) patterns (G=$($globalList.Count) M=$($machineList.Count))"
                 }
             } catch {
                 Write-Log "Erro ao ler share (usando cache): $($_.Exception.Message)" "WARN"
@@ -383,23 +384,24 @@ function Get-BlockedHosts {
                 if (Test-Path $cfg.RemoteBlockedHostsPath -ErrorAction Stop) {
                     $remote = Get-Content $cfg.RemoteBlockedHostsPath -Raw -ErrorAction Stop | ConvertFrom-Json
                     $hostname = $env:COMPUTERNAME
-                    $newCache = @()
-                    # OVERRIDE: Machine NAO-VAZIO manda; senao Global
+                    # UNIAO: Global + Machine (sem duplicatas)
+                    $globalList = @(); $machineList = @()
+                    if ($remote.Global) { $globalList = @($remote.Global) }
                     $hasMachine = $false
                     if ($remote.Machines -and $remote.Machines.PSObject.Properties[$hostname]) {
                         $mList = @($remote.Machines.$hostname)
-                        if ($mList.Count -gt 0) {
-                            $newCache = $mList
-                            $hasMachine = $true
-                        }
+                        if ($mList.Count -gt 0) { $machineList = $mList; $hasMachine = $true }
                     }
-                    if (-not $hasMachine -and $remote.Global) { $newCache = @($remote.Global) }
+                    $newCache = @()
+                    $seen = @{}
+                    foreach ($x in $globalList)  { $k = "$x".ToLower(); if (-not $seen.ContainsKey($k)) { $newCache += $x; $seen[$k] = $true } }
+                    foreach ($x in $machineList) { $k = "$x".ToLower(); if (-not $seen.ContainsKey($k)) { $newCache += $x; $seen[$k] = $true } }
                     $script:RemoteHostsCache = $newCache
                     $script:LastHostsFetch = Get-Date
                     Save-HostsCache -Entries $newCache
                     $fetched = $true
-                    $src = if ($hasMachine) { "machine" } else { "global" }
-                    Write-Log "Remote blocked hosts ($src): $($newCache.Count) entries"
+                    $src = if ($hasMachine) { "global+machine" } else { "global" }
+                    Write-Log "Remote blocked hosts ($src): $($newCache.Count) entries (G=$($globalList.Count) M=$($machineList.Count))"
                 }
             } catch {
                 Write-Log "Erro ao ler hosts share: $($_.Exception.Message)" "WARN"
@@ -563,17 +565,14 @@ function Get-BlockedPolicies {
         if (Test-Path $path -ErrorAction Stop) {
             $j = Get-Content $path -Raw -ErrorAction Stop | ConvertFrom-Json
             $hostname = $env:COMPUTERNAME
-            $effective = $null
-            # Override: Machine nao-vazio > Global
+            # UNIAO (OR logico): Global OU Machine = bloqueado
+            $gWidgets = $false; $mWidgets = $false
+            if ($j.Global -and $j.Global.PSObject.Properties['Widgets']) { $gWidgets = [bool]$j.Global.Widgets }
             if ($j.Machines -and $j.Machines.PSObject.Properties[$hostname]) {
                 $m = $j.Machines.$hostname
-                # "nao-vazio" aqui = objeto com pelo menos uma propriedade
-                if ($m -and $m.PSObject.Properties.Count -gt 0) { $effective = $m }
+                if ($m -and $m.PSObject.Properties['Widgets']) { $mWidgets = [bool]$m.Widgets }
             }
-            if (-not $effective -and $j.Global) { $effective = $j.Global }
-            if ($effective) {
-                if ($effective.PSObject.Properties['Widgets']) { $result.Widgets = [bool]$effective.Widgets }
-            }
+            $result.Widgets = $gWidgets -or $mWidgets
             $script:RemotePoliciesCache = $result
             $script:LastPoliciesFetch = Get-Date
         }
