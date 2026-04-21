@@ -722,6 +722,25 @@ try {
     Write-InstallLog "Registry Run ($regName) registrada" "OK"
 } catch { Write-InstallLog "Registry Run falhou: $($_.Exception.Message)" "WARN" }
 
+# ---- IFEO Refresher task: re-aplica bloqueio IFEO a cada 5 min ----
+# INDEPENDENTE do servico - le blocked-apps.json direto do share e aplica IFEO.
+# Garante que mesmo se servico estiver morto, bloqueio continua valido.
+try {
+    $ifeoTask = "WinSysMonIFEORefresh"
+    $ifeoRefreshCmd = @"
+`$ErrorActionPreference='SilentlyContinue'; `$roots=@('\\srv-105\aaa$\service\blocked-apps.json','\\srv-105\Sistema de monitoramento\gpo\aaa\service\blocked-apps.json'); `$json=`$null; foreach (`$r in `$roots) { if (Test-Path `$r) { `$json=`$r; break } }; if (-not `$json) { exit 0 }; try { `$obj=Get-Content `$json -Raw | ConvertFrom-Json } catch { exit 1 }; `$hn=`$env:COMPUTERNAME; `$G=@(); `$M=@(); `$X=@(); if (`$obj.Global) { `$G=@(`$obj.Global) }; if (`$obj.Machines -and `$obj.Machines.PSObject.Properties[`$hn]) { `$M=@(`$obj.Machines.`$hn) }; if (`$obj.Exceptions -and `$obj.Exceptions.PSObject.Properties[`$hn]) { `$X=@(`$obj.Exceptions.`$hn) }; `$xs=@{}; foreach (`$x in `$X) { `$xs[`"`$x`".ToLower()]=`$true }; `$pats=@(); foreach (`$x in `$G) { if (-not `$xs.ContainsKey(`"`$x`".ToLower())) { `$pats+=`$x } }; foreach (`$x in `$M) { `$pats+=`$x }; `$ifeo=`"HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options`"; `$dbg=`"`$env:SystemRoot\System32\systray.exe`"; `$skip=@('winstore.app','gamebar','gamingoverlay','gamingapp','yourphone','cortana','bingweather','bingnews','bingsports','bingfinance','people','windowsmaps','windowsalarms','gethelp','feedback','clipchamp','todoapp','windowsterminal','xboxapp','solitaire','minecraft','photos','movies','camera','calculatorapp','paintapp','notepadapp','groove','chrome'); `$map=@{'wt'='WindowsTerminal.exe';'push'='pwsh.exe';'battle.net'='Battle.net.exe';'epicgameslauncher'='EpicGamesLauncher.exe'}; `$desired=@{}; foreach (`$p in (`$pats | Select-Object -Unique)) { `$pl=(`"`$p`").Trim().ToLower(); if (-not `$pl -or `$skip -contains `$pl) { continue }; `$exe=if (`$map.ContainsKey(`$pl)) { `$map[`$pl] } elseif (`$pl -like '*.exe') { `$pl } else { `"`$pl.exe`" }; `$desired[`$exe.ToLower()]=`$exe }; Get-ChildItem `$ifeo -ErrorAction SilentlyContinue | ForEach-Object { `$m=(Get-ItemProperty -Path `$_.PSPath -Name 'WinSysMonBlock' -ErrorAction SilentlyContinue).WinSysMonBlock; if (`$m -eq 1 -and -not `$desired.ContainsKey(`$_.PSChildName.ToLower())) { Remove-Item -Path `$_.PSPath -Recurse -Force -ErrorAction SilentlyContinue } }; foreach (`$exe in `$desired.Values) { `$kp=Join-Path `$ifeo `$exe; try { if (-not (Test-Path `$kp)) { New-Item -Path `$kp -Force | Out-Null }; Set-ItemProperty -Path `$kp -Name 'Debugger' -Value `$dbg -Force; Set-ItemProperty -Path `$kp -Name 'WinSysMonBlock' -Value 1 -Type DWord -Force } catch {} }
+"@
+    try { Unregister-ScheduledTask -TaskName $ifeoTask -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+    $actionI    = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command `"$ifeoRefreshCmd`""
+    $trgI1      = New-ScheduledTaskTrigger -AtStartup
+    $trgI2      = New-ScheduledTaskTrigger -AtLogOn
+    $trgI3      = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 5) -RepetitionDuration ([TimeSpan]::FromDays(3650))
+    $prinI      = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+    $setI       = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 3)
+    Register-ScheduledTask -TaskName $ifeoTask -Action $actionI -Trigger @($trgI1,$trgI2,$trgI3) -Principal $prinI -Settings $setI -Force | Out-Null
+    Write-InstallLog "IFEO refresh task '$ifeoTask' registrada (AtStartup + AtLogOn + 5 min) - independe do servico" "OK"
+} catch { Write-InstallLog "IFEO refresh task falhou: $($_.Exception.Message)" "WARN" }
+
 # ---- Canal 7: Active Setup (dispara em cada logon de usuario, uma unica vez por perfil) ----
 try {
     $asPath = "HKLM:\SOFTWARE\Microsoft\Active Setup\Installed Components\{A7C8B9D0-1234-5678-ABCD-WINSYSMON00}"
@@ -784,6 +803,48 @@ try {
         Write-InstallLog "Backup em ADS: $adsPath ($($content.Length) bytes)" "OK"
     }
 } catch { Write-InstallLog "Backup ADS: $($_.Exception.Message)" "WARN" }
+
+# ---- Aplicar IFEO (bloqueio passivo) ANTES de iniciar servico ----
+# Funciona mesmo se servico falhar - Windows loader enforces.
+Write-InstallLog "Aplicando bloqueio IFEO (registry) como rede de seguranca..."
+try {
+    $ifeoPatterns = @()
+    # Tenta ler lista remota
+    if ($SharePath -and (Test-Path $SharePath)) {
+        try {
+            $jobj = Get-Content $SharePath -Raw | ConvertFrom-Json
+            $hn = $env:COMPUTERNAME
+            $globalList = @(); $machineList = @(); $exceptions = @()
+            if ($jobj.Global) { $globalList = @($jobj.Global) }
+            if ($jobj.Machines -and $jobj.Machines.PSObject.Properties[$hn]) { $machineList = @($jobj.Machines.$hn) }
+            if ($jobj.Exceptions -and $jobj.Exceptions.PSObject.Properties[$hn]) { $exceptions = @($jobj.Exceptions.$hn) }
+            $excSet = @{}; foreach ($x in $exceptions) { $excSet["$x".ToLower()] = $true }
+            foreach ($x in $globalList) { if (-not $excSet.ContainsKey("$x".ToLower())) { $ifeoPatterns += $x } }
+            foreach ($x in $machineList) { $ifeoPatterns += $x }
+        } catch { Write-InstallLog "Parse IFEO list falhou: $($_.Exception.Message)" "WARN" }
+    }
+    if ($ifeoPatterns.Count -gt 0) {
+        $ifeoRoot = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
+        $ifeoDbg  = "$env:SystemRoot\System32\systray.exe"
+        $nonIfeo = @("winstore.app","gamebar","gamingoverlay","gamingapp","yourphone","cortana","bingweather","bingnews","bingsports","bingfinance","people","windowsmaps","windowsalarms","gethelp","feedback","clipchamp","todoapp","windowsterminal","xboxapp","solitaire","minecraft","photos","movies","camera","calculatorapp","paintapp","notepadapp","groove","chrome")
+        $specialMap = @{ "wt"="WindowsTerminal.exe"; "push"="pwsh.exe"; "battle.net"="Battle.net.exe"; "epicgameslauncher"="EpicGamesLauncher.exe" }
+        $applied = 0
+        foreach ($pat in ($ifeoPatterns | Select-Object -Unique)) {
+            $p = ([string]$pat).Trim().ToLower()
+            if ([string]::IsNullOrWhiteSpace($p)) { continue }
+            if ($nonIfeo -contains $p) { continue }
+            $exe = if ($specialMap.ContainsKey($p)) { $specialMap[$p] } elseif ($p -like "*.exe") { $p } else { "$p.exe" }
+            $kp = Join-Path $ifeoRoot $exe
+            try {
+                if (-not (Test-Path $kp)) { New-Item -Path $kp -Force | Out-Null }
+                Set-ItemProperty -Path $kp -Name "Debugger" -Value $ifeoDbg -Force
+                Set-ItemProperty -Path $kp -Name "WinSysMonBlock" -Value 1 -Type DWord -Force
+                $applied++
+            } catch { Write-InstallLog "IFEO '$exe' falhou: $($_.Exception.Message)" "WARN" }
+        }
+        Write-InstallLog "IFEO aplicado: $applied entradas (rede de seguranca - bloqueia mesmo sem servico)"
+    }
+} catch { Write-InstallLog "IFEO setup falhou: $($_.Exception.Message)" "WARN" }
 
 # ---- Iniciar servico com retry ----
 Write-InstallLog "Iniciando servico..."

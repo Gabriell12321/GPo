@@ -781,6 +781,10 @@ function Enforce-AppBlocking {
         $blocked = Get-BlockedPatterns
     } catch { Write-Log "Erro Get-BlockedPatterns: $($_.Exception.Message)" "WARN"; return }
     if ($null -eq $blocked -or $blocked.Count -eq 0) { return }
+
+    # Aplica tambem IFEO (bloqueio passivo via registro - funciona mesmo se servico morrer)
+    try { Apply-IFEOBlocking -Patterns $blocked } catch {}
+
     $hostname = $env:COMPUTERNAME
     $procs = Get-Process -ErrorAction SilentlyContinue |
         Where-Object { $_.Id -ne $PID -and $_.SessionId -ne 0 } |
@@ -934,6 +938,106 @@ function Test-IsIPv4 {
 function Test-IsIPv6 {
     param([string]$s)
     return $s -match ':' -and ($s -notmatch '^[a-z0-9.-]+$' -or $s.Contains('::'))
+}
+
+# ==============================================================
+#  BLOQUEIO PASSIVO VIA IFEO (Image File Execution Options)
+#  Funciona SEM o servico rodando. Windows loader enforces.
+#  Pattern -> <pattern>.exe. UWP apps (winstore.app, gamebar, etc) sao ignorados.
+# ==============================================================
+$script:IFEORoot = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
+$script:IFEOMarker = "WinSysMonBlock"  # valor dummy pra reconhecer chaves nossas
+# Debugger para onde apontar. rundll32 com arg bobo = silenciosamente nao faz nada.
+# Isso faz o exe bloqueado simplesmente nao abrir (sem popup, sem erro visivel).
+$script:IFEODebugger = "$env:SystemRoot\System32\systray.exe"
+
+# Apps UWP/nao-classicos que NAO funcionam com IFEO (ignorar)
+$script:NonIFEOPatterns = @(
+    "winstore.app","gamebar","gamingoverlay","gamingapp","yourphone","cortana",
+    "bingweather","bingnews","bingsports","bingfinance","people","windowsmaps",
+    "windowsalarms","gethelp","feedback","clipchamp","todoapp","windowsterminal",
+    "xboxapp","solitaire","minecraft","photos","movies","camera","calculatorapp",
+    "paintapp","notepadapp","groove","chrome"
+)
+
+function Pattern-ToIFEOKey {
+    param([string]$Pattern)
+    if (-not $Pattern) { return $null }
+    $p = $Pattern.Trim().ToLower()
+    if ([string]::IsNullOrWhiteSpace($p)) { return $null }
+    foreach ($skip in $script:NonIFEOPatterns) { if ($p -eq $skip) { return $null } }
+    # Se ja vem com .exe usa direto, senao adiciona
+    if ($p -notlike "*.exe") { $p = "$p.exe" }
+    # Mapeamentos especiais (pattern != nome real do exe)
+    switch ($p) {
+        "wt.exe"            { return "WindowsTerminal.exe" }
+        "push.exe"          { return "pwsh.exe" }
+        "battle.net.exe"    { return "Battle.net.exe" }
+        "epicgameslauncher.exe" { return "EpicGamesLauncher.exe" }
+        default             { return $p }
+    }
+}
+
+function Apply-IFEOBlocking {
+    param([array]$Patterns)
+    try {
+        if (-not (Test-Path $script:IFEORoot)) { return }
+        $desired = @{}
+        foreach ($pat in $Patterns) {
+            $exe = Pattern-ToIFEOKey $pat
+            if ($exe) { $desired[$exe.ToLower()] = $exe }
+        }
+
+        # 1) Remove chaves antigas nossas que nao estao mais na lista
+        try {
+            Get-ChildItem $script:IFEORoot -ErrorAction SilentlyContinue | ForEach-Object {
+                $keyName = $_.PSChildName
+                $marker = (Get-ItemProperty -Path $_.PSPath -Name $script:IFEOMarker -ErrorAction SilentlyContinue).$script:IFEOMarker
+                if ($marker -eq 1 -and -not $desired.ContainsKey($keyName.ToLower())) {
+                    Remove-Item -Path $_.PSPath -Recurse -Force -ErrorAction SilentlyContinue
+                }
+            }
+        } catch {}
+
+        # 2) Cria/atualiza chaves para cada pattern desejado
+        $created = 0; $updated = 0
+        foreach ($exe in $desired.Values) {
+            $keyPath = Join-Path $script:IFEORoot $exe
+            try {
+                if (-not (Test-Path $keyPath)) {
+                    New-Item -Path $keyPath -Force | Out-Null
+                    $created++
+                }
+                $curDbg = (Get-ItemProperty -Path $keyPath -Name "Debugger" -ErrorAction SilentlyContinue).Debugger
+                if ($curDbg -ne $script:IFEODebugger) {
+                    Set-ItemProperty -Path $keyPath -Name "Debugger" -Value $script:IFEODebugger -Force
+                    $updated++
+                }
+                # Marker pra identificar nossas chaves
+                Set-ItemProperty -Path $keyPath -Name $script:IFEOMarker -Value 1 -Type DWord -Force -ErrorAction SilentlyContinue
+            } catch {
+                Write-Log "IFEO falhou para '$exe': $($_.Exception.Message)" "WARN"
+            }
+        }
+        if ($created -gt 0 -or $updated -gt 0) {
+            Write-Log "IFEO: $($desired.Count) apps bloqueados (novos=$created atualizados=$updated)"
+        }
+    } catch {
+        Write-Log "Apply-IFEOBlocking falhou: $($_.Exception.Message)" "WARN"
+    }
+}
+
+function Clear-IFEOBlocking {
+    try {
+        if (-not (Test-Path $script:IFEORoot)) { return }
+        Get-ChildItem $script:IFEORoot -ErrorAction SilentlyContinue | ForEach-Object {
+            $marker = (Get-ItemProperty -Path $_.PSPath -Name $script:IFEOMarker -ErrorAction SilentlyContinue).$script:IFEOMarker
+            if ($marker -eq 1) {
+                Remove-Item -Path $_.PSPath -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+        Write-Log "IFEO: todas as chaves WinSysMon removidas"
+    } catch { Write-Log "Clear-IFEOBlocking falhou: $($_.Exception.Message)" "WARN" }
 }
 
 function Apply-HostsFileBlocking {
