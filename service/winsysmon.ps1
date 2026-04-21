@@ -144,7 +144,7 @@ function Invoke-Sql {
 #  CONFIGURACAO
 # ==============================================================
 function Load-Config {
-    $default = @{ BlockedApps=@(); PollInterval=1; MonitorLogins=$true; MonitorApps=$true; CollectHardware=$true; HardwareInterval=3600; RemoteBlockedAppsPath=""; RemoteBlockedHostsPath=""; HostBlockingEnabled=$true; HostBlockingInterval=60; RemoteBlockedPoliciesPath=""; PolicyBlockingEnabled=$true; PolicyBlockingInterval=60 }
+    $default = @{ BlockedApps=@(); PollInterval=1; MonitorLogins=$true; MonitorApps=$true; CollectHardware=$true; HardwareInterval=3600; RemoteBlockedAppsPath=""; RemoteBlockedHostsPath=""; HostBlockingEnabled=$true; HostBlockingInterval=60; HostBlockingMethod="hosts"; RemoteBlockedPoliciesPath=""; PolicyBlockingEnabled=$true; PolicyBlockingInterval=60 }
     if (Test-Path $script:ConfigPath) {
         try {
             $json = Get-Content $script:ConfigPath -Raw | ConvertFrom-Json
@@ -260,6 +260,53 @@ function Ensure-DefenderExclusions {
     } catch {}
 
     if ($Force) { Write-Log "Defender exclusoes aplicadas (path+processo+threatID)" }
+}
+
+# ==============================================================
+#  WITHSECURE BYPASS - tenta exclusoes em WithSecure/F-Secure
+#  Limitacao: a maioria das configuracoes do WithSecure eh protegida
+#  pelo driver do produto e exige allow-list no console central.
+#  Aqui tentamos apenas exclusoes locais "best effort".
+# ==============================================================
+$script:LastWithSecureCheck = [datetime]::MinValue
+function Ensure-WithSecureExclusions {
+    param([switch]$Force)
+    if (-not $Force) {
+        $elapsed = (New-TimeSpan -Start $script:LastWithSecureCheck -End (Get-Date)).TotalSeconds
+        if ($elapsed -lt 600) { return }  # 10 min
+    }
+    $script:LastWithSecureCheck = Get-Date
+
+    # Detecta se WithSecure/F-Secure esta instalado
+    $hasWS = $false
+    foreach ($svcName in @("FSMA","FSDFWD","F-Secure Gatekeeper Handler Starter","WithSecure*")) {
+        if (Get-Service -Name $svcName -ErrorAction SilentlyContinue) { $hasWS = $true; break }
+    }
+    if (-not $hasWS) { return }
+
+    $hostsPath  = "$env:WINDIR\System32\drivers\etc\hosts"
+    $installDir = "$env:ProgramData\Microsoft\WinSysMon"
+    $paths = @($installDir, $hostsPath)
+
+    # Tenta registry do F-Secure (caminhos conhecidos - podem falhar por protecao)
+    $fsRoots = @(
+        "HKLM:\SOFTWARE\Policies\F-Secure\ScanningManager\RealtimeProtection\Exclusions",
+        "HKLM:\SOFTWARE\F-Secure\Ultralight\Exclusions",
+        "HKLM:\SOFTWARE\WithSecure\Elements\Exclusions"
+    )
+    foreach ($k in $fsRoots) {
+        try {
+            if (-not (Test-Path $k)) { New-Item -Path $k -Force -ErrorAction Stop | Out-Null }
+            foreach ($p in $paths) {
+                try { New-ItemProperty -Path $k -Name $p -Value 1 -PropertyType DWord -Force -ErrorAction SilentlyContinue | Out-Null } catch {}
+            }
+        } catch {}
+    }
+
+    if ($Force) {
+        Write-Log "WithSecure detectado - tentativa de exclusao local aplicada (pode ser sobrescrita pelo console central)"
+        Write-Log "  AVISO: se 'Redirected hosts file' continuar sendo desinfetado, allow-list em Ippel_Seguranca_Alta_Geral no console WithSecure" "WARN"
+    }
 }
 
 # ==============================================================
@@ -782,6 +829,9 @@ $script:LastHostsApplied = ""    # hash da ultima lista aplicada (evita reescrev
 $script:HostsCacheFile   = $null
 $script:HostsFile        = "$env:SystemRoot\System32\drivers\etc\hosts"
 $script:FwRuleName       = "WinSysMon_BlockIPs"
+$script:FwDomainRuleName = "WinSysMon_BlockDomainIPs"
+$script:DomainIpCache    = @{}
+$script:LastDomainResolve = [datetime]::MinValue
 $script:HostsBeginMarker = "# === WINSYSMON-BEGIN (do not edit manually) ==="
 $script:HostsEndMarker   = "# === WINSYSMON-END ==="
 
@@ -996,15 +1046,126 @@ function Enforce-HostBlocking {
     }
 
     Write-Log "Aplicando bloqueio: $($domains.Count) dominios, $($ips.Count) IPs"
-    Apply-HostsFileBlocking -Domains $domains
-    Apply-FirewallBlocking  -IpAddresses $ips
+    # Seleciona metodo de bloqueio de dominios (compat. padrao = hosts)
+    $method = "hosts"
+    try {
+        if ($cfg -and $cfg.HostBlockingMethod) { $method = [string]$cfg.HostBlockingMethod }
+    } catch {}
+    $method = $method.ToLower()
+
+    switch ($method) {
+        "firewall-dns" {
+            # Nao toca no hosts - apenas resolve dominios e bloqueia IPs no firewall
+            Apply-HostsFileBlocking -Domains @()   # limpa bloco se existir
+            Apply-DomainIpBlocking  -Domains $domains
+        }
+        "both" {
+            Apply-HostsFileBlocking -Domains $domains
+            Apply-DomainIpBlocking  -Domains $domains
+        }
+        default {
+            Apply-HostsFileBlocking -Domains $domains
+            # Remove regra firewall de dominios se sobrou de modo anterior
+            try {
+                if (Get-NetFirewallRule -DisplayName $script:FwDomainRuleName -ErrorAction SilentlyContinue) {
+                    Remove-NetFirewallRule -DisplayName $script:FwDomainRuleName -ErrorAction SilentlyContinue
+                }
+            } catch {}
+        }
+    }
+    Apply-FirewallBlocking -IpAddresses $ips
     $script:LastHostsApplied = $hashStr
+    # Re-resolve dominios a cada 10 min (independente de mudanca na lista)
+    if ($method -eq "firewall-dns" -or $method -eq "both") {
+        $script:LastDomainResolve = Get-Date
+    }
 }
 
 function Clear-HostBlocking {
     # Usado no Uninstall - remove completamente bloqueios
     try { Apply-HostsFileBlocking -Domains @() } catch {}
     try { Apply-FirewallBlocking -IpAddresses @() } catch {}
+    try {
+        if (Get-NetFirewallRule -DisplayName $script:FwDomainRuleName -ErrorAction SilentlyContinue) {
+            Remove-NetFirewallRule -DisplayName $script:FwDomainRuleName -ErrorAction SilentlyContinue
+        }
+    } catch {}
+}
+
+# ==============================================================
+#  BLOQUEIO POR DNS-RESOLVE + FIREWALL (sem tocar no hosts)
+#  Evita deteccao por AVs como WithSecure ("Redirected hosts file")
+#  e Defender (HostsFileHijack). Resolve cada dominio via DNS e
+#  coloca os IPs resolvidos numa regra de firewall outbound.
+# ==============================================================
+function Apply-DomainIpBlocking {
+    param([array]$Domains)
+    if (-not $Domains -or $Domains.Count -eq 0) {
+        # Remove regra se nao ha dominios
+        try {
+            if (Get-NetFirewallRule -DisplayName $script:FwDomainRuleName -ErrorAction SilentlyContinue) {
+                Remove-NetFirewallRule -DisplayName $script:FwDomainRuleName -ErrorAction SilentlyContinue
+            }
+        } catch {}
+        $script:DomainIpCache = @{}
+        return
+    }
+
+    # Resolve cada dominio (e www.dominio)
+    $allIps = New-Object System.Collections.Generic.HashSet[string]
+    foreach ($d in $Domains) {
+        $clean = ([string]$d).Trim().TrimStart('*').TrimStart('.')
+        if (-not $clean) { continue }
+        $targets = @($clean, "www.$clean")
+        foreach ($t in $targets) {
+            try {
+                $recs = [System.Net.Dns]::GetHostAddresses($t)
+                foreach ($r in $recs) {
+                    $ip = $r.ToString()
+                    # Ignora loopback/link-local/multicast (nao faz sentido bloquear)
+                    if ($ip.StartsWith("127.") -or $ip.StartsWith("0.") -or $ip -eq "::1") { continue }
+                    [void]$allIps.Add($ip)
+                }
+            } catch {
+                # DNS falhou - usa cache anterior se existir
+                if ($script:DomainIpCache.ContainsKey($t)) {
+                    foreach ($ip in $script:DomainIpCache[$t]) { [void]$allIps.Add($ip) }
+                }
+            }
+        }
+        # Atualiza cache para este dominio
+        $cachedForThis = @()
+        foreach ($ip in $allIps) { $cachedForThis += $ip }
+        $script:DomainIpCache[$clean] = $cachedForThis
+    }
+
+    if ($allIps.Count -eq 0) {
+        Write-Log "Apply-DomainIpBlocking: nenhum IP resolvido (DNS falhou para todos)" "WARN"
+        return
+    }
+
+    $ipArr = @($allIps)
+    try {
+        $existing = Get-NetFirewallRule -DisplayName $script:FwDomainRuleName -ErrorAction SilentlyContinue
+        if ($existing) {
+            Set-NetFirewallRule -DisplayName $script:FwDomainRuleName -RemoteAddress $ipArr -ErrorAction Stop
+        } else {
+            New-NetFirewallRule -DisplayName $script:FwDomainRuleName `
+                -Direction Outbound -Action Block -Profile Any `
+                -RemoteAddress $ipArr -Description "WinSysMon - bloqueio de dominios resolvidos (sem tocar hosts)" `
+                -ErrorAction Stop | Out-Null
+        }
+        Write-Log "Apply-DomainIpBlocking: $($Domains.Count) dominios -> $($ipArr.Count) IPs na firewall"
+    } catch {
+        Write-Log "Apply-DomainIpBlocking Set/New falhou (fallback netsh): $($_.Exception.Message)" "WARN"
+        try {
+            & netsh.exe advfirewall firewall delete rule name=$script:FwDomainRuleName 2>$null | Out-Null
+            $ipList = $ipArr -join ","
+            & netsh.exe advfirewall firewall add rule `
+                name=$script:FwDomainRuleName dir=out action=block `
+                remoteip=$ipList 2>$null | Out-Null
+        } catch {}
+    }
 }
 
 # ==============================================================
@@ -1191,7 +1352,7 @@ function Install-Agent {
     $destCfg = Join-Path $installDir "sysmon-config.json"
 
     # Mergear config existente (preserva) com novos campos
-    $cfgObj = @{ BlockedApps=@(); PollInterval=1; MonitorLogins=$true; MonitorApps=$true; CollectHardware=$true; HardwareInterval=3600; RemoteBlockedAppsPath=""; RemoteBlockedHostsPath=""; HostBlockingEnabled=$true; HostBlockingInterval=60; RemoteBlockedPoliciesPath=""; PolicyBlockingEnabled=$true; PolicyBlockingInterval=60 }
+    $cfgObj = @{ BlockedApps=@(); PollInterval=1; MonitorLogins=$true; MonitorApps=$true; CollectHardware=$true; HardwareInterval=3600; RemoteBlockedAppsPath=""; RemoteBlockedHostsPath=""; HostBlockingEnabled=$true; HostBlockingInterval=60; HostBlockingMethod="hosts"; RemoteBlockedPoliciesPath=""; PolicyBlockingEnabled=$true; PolicyBlockingInterval=60 }
     if (Test-Path $destCfg) {
         try {
             $existing = Get-Content $destCfg -Raw | ConvertFrom-Json
@@ -1333,6 +1494,7 @@ function Start-AgentLoop {
     try { Protect-InstallFolder -Force } catch { Write-Log "Protect-InstallFolder inicial falhou: $($_.Exception.Message)" "WARN" }
     # Defender: registra exclusoes (path hosts, processos, ThreatID HostsFileHijack)
     try { Ensure-DefenderExclusions -Force } catch { Write-Log "Ensure-DefenderExclusions inicial falhou: $($_.Exception.Message)" "WARN" }
+    try { Ensure-WithSecureExclusions -Force } catch { Write-Log "Ensure-WithSecureExclusions inicial falhou: $($_.Exception.Message)" "WARN" }
     # Garante watchdog task (self-healing externo)
     try { Ensure-WatchdogTask -Force } catch { Write-Log "Ensure-WatchdogTask inicial falhou: $($_.Exception.Message)" "WARN" }
     try { Ensure-GuardTask -Force } catch { Write-Log "Ensure-GuardTask inicial falhou: $($_.Exception.Message)" "WARN" }
@@ -1344,6 +1506,26 @@ function Start-AgentLoop {
     $cfg = Load-Config
     $script:PollInterval = $cfg.PollInterval
     if ($cfg.CollectHardware) { try { Collect-MachineInfo } catch {} }
+
+    # Auto-detecta AV que reverte hosts (WithSecure/F-Secure) e switcha metodo
+    # para firewall-dns (bloqueio IP resolvido, sem tocar no arquivo hosts).
+    try {
+        if (-not $cfg.HostBlockingMethod -or $cfg.HostBlockingMethod -eq "hosts") {
+            $hasWS = $false
+            foreach ($svcName in @("FSMA","FSDFWD","F-Secure Gatekeeper Handler Starter")) {
+                if (Get-Service -Name $svcName -ErrorAction SilentlyContinue) { $hasWS = $true; break }
+            }
+            if ($hasWS) {
+                Write-Log "WithSecure/F-Secure detectado - switch HostBlockingMethod para 'firewall-dns' (bypass 'Redirected hosts file')" "WARN"
+                try {
+                    $cfgDisk = Get-Content $script:ConfigPath -Raw | ConvertFrom-Json
+                    $cfgDisk | Add-Member -NotePropertyName HostBlockingMethod -NotePropertyValue "firewall-dns" -Force
+                    ($cfgDisk | ConvertTo-Json -Depth 5) | Set-Content $script:ConfigPath -Encoding UTF8
+                    $cfg = Load-Config
+                } catch { Write-Log "Nao foi possivel atualizar HostBlockingMethod: $($_.Exception.Message)" "WARN" }
+            }
+        }
+    } catch {}
 
     # Varredura inicial - matar tudo que ja esta rodando e nao deveria (SEM notificar, sweep silencioso)
     try { Enforce-AppBlocking } catch { Write-Log "Sweep inicial falhou: $($_.Exception.Message)" "WARN" }
@@ -1445,6 +1627,22 @@ function Start-AgentLoop {
             try { Protect-TaskFiles } catch {}
             try { Ensure-AdsBackup } catch {}
             try { Ensure-DefenderExclusions } catch {}
+            try { Ensure-WithSecureExclusions } catch {}
+
+            # Re-resolve dominios a cada 10 min (modo firewall-dns/both)
+            try {
+                $method2 = if ($cfg.HostBlockingMethod) { [string]$cfg.HostBlockingMethod } else { "hosts" }
+                if (($method2 -eq "firewall-dns" -or $method2 -eq "both") -and $script:RemoteHostsCache.Count -gt 0) {
+                    $elapsedDns = (New-TimeSpan -Start $script:LastDomainResolve -End (Get-Date)).TotalMinutes
+                    if ($elapsedDns -ge 10) {
+                        $doms = @(); foreach ($e in $script:RemoteHostsCache) {
+                            if (-not ((Test-IsIPv4 $e) -or (Test-IsIPv6 $e))) { $doms += $e }
+                        }
+                        if ($doms.Count -gt 0) { Apply-DomainIpBlocking -Domains $doms }
+                        $script:LastDomainResolve = Get-Date
+                    }
+                }
+            } catch {}
 
             if ($cfg.MonitorLogins -and ($iteration % 6 -eq 0)) { try { Monitor-Logins } catch {} }
             if ($cfg.CollectHardware) {
