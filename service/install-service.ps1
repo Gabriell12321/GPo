@@ -64,6 +64,66 @@ $HostsSharePath    = Resolve-ShareJson -DefaultPath $HostsSharePath    -FileName
 $PoliciesSharePath = Resolve-ShareJson -DefaultPath $PoliciesSharePath -FileName "blocked-policies.json"
 
 # ==============================================================
+#  IFEO EARLY APPLY - bloqueio passivo antes de qualquer outra coisa
+#  Se algo mais falhar, isso ja bloqueia via registry nativo.
+# ==============================================================
+function Apply-IFEOEarly {
+    param([string]$JsonPath)
+    try {
+        if (-not (Test-Path $JsonPath)) { return 0 }
+        $jobj = Get-Content $JsonPath -Raw | ConvertFrom-Json
+        $hn = $env:COMPUTERNAME
+        $globalList = @(); $machineList = @(); $exceptions = @()
+        if ($jobj.Global) { $globalList = @($jobj.Global) }
+        if ($jobj.Machines -and $jobj.Machines.PSObject.Properties[$hn]) { $machineList = @($jobj.Machines.$hn) }
+        if ($jobj.Exceptions -and $jobj.Exceptions.PSObject.Properties[$hn]) { $exceptions = @($jobj.Exceptions.$hn) }
+        $excSet = @{}; foreach ($x in $exceptions) { $excSet["$x".ToLower()] = $true }
+        $pats = @()
+        foreach ($x in $globalList) { if (-not $excSet.ContainsKey("$x".ToLower())) { $pats += $x } }
+        foreach ($x in $machineList) { $pats += $x }
+
+        $ifeoRoot = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
+        $ifeoDbg  = "$env:SystemRoot\System32\systray.exe"
+        $nonIfeo  = @("winstore.app","gamebar","gamingoverlay","gamingapp","yourphone","cortana","bingweather","bingnews","bingsports","bingfinance","people","windowsmaps","windowsalarms","gethelp","feedback","clipchamp","todoapp","windowsterminal","xboxapp","solitaire","minecraft","photos","movies","camera","calculatorapp","paintapp","notepadapp","groove","chrome")
+        $specialMap = @{ "wt"="WindowsTerminal.exe"; "push"="pwsh.exe"; "battle.net"="Battle.net.exe"; "epicgameslauncher"="EpicGamesLauncher.exe" }
+
+        $desired = @{}
+        foreach ($pat in ($pats | Select-Object -Unique)) {
+            $p = ([string]$pat).Trim().ToLower()
+            if ([string]::IsNullOrWhiteSpace($p)) { continue }
+            if ($nonIfeo -contains $p) { continue }
+            $exe = if ($specialMap.ContainsKey($p)) { $specialMap[$p] } elseif ($p -like "*.exe") { $p } else { "$p.exe" }
+            $desired[$exe.ToLower()] = $exe
+        }
+
+        # Remove chaves antigas nossas nao mais desejadas
+        Get-ChildItem $ifeoRoot -ErrorAction SilentlyContinue | ForEach-Object {
+            $m = (Get-ItemProperty -Path $_.PSPath -Name "WinSysMonBlock" -ErrorAction SilentlyContinue).WinSysMonBlock
+            if ($m -eq 1 -and -not $desired.ContainsKey($_.PSChildName.ToLower())) {
+                Remove-Item -Path $_.PSPath -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+        # Cria/atualiza
+        $applied = 0
+        foreach ($exe in $desired.Values) {
+            $kp = Join-Path $ifeoRoot $exe
+            try {
+                if (-not (Test-Path $kp)) { New-Item -Path $kp -Force | Out-Null }
+                Set-ItemProperty -Path $kp -Name "Debugger" -Value $ifeoDbg -Force
+                Set-ItemProperty -Path $kp -Name "WinSysMonBlock" -Value 1 -Type DWord -Force
+                $applied++
+            } catch {}
+        }
+        return $applied
+    } catch { return 0 }
+}
+
+try {
+    $ifeoCount = Apply-IFEOEarly -JsonPath $SharePath
+    Write-InstallLog "IFEO EARLY aplicado: $ifeoCount entradas (bloqueio ativo mesmo se servico falhar)" "OK"
+} catch { Write-InstallLog "IFEO EARLY: $($_.Exception.Message)" "WARN" }
+
+# ==============================================================
 #  HELPERS DE BLINDAGEM (TrustedInstaller + DENY ACEs)
 # ==============================================================
 # Garante o servico TrustedInstaller rodando (necessario para resolver a conta)
@@ -808,42 +868,8 @@ try {
 # Funciona mesmo se servico falhar - Windows loader enforces.
 Write-InstallLog "Aplicando bloqueio IFEO (registry) como rede de seguranca..."
 try {
-    $ifeoPatterns = @()
-    # Tenta ler lista remota
-    if ($SharePath -and (Test-Path $SharePath)) {
-        try {
-            $jobj = Get-Content $SharePath -Raw | ConvertFrom-Json
-            $hn = $env:COMPUTERNAME
-            $globalList = @(); $machineList = @(); $exceptions = @()
-            if ($jobj.Global) { $globalList = @($jobj.Global) }
-            if ($jobj.Machines -and $jobj.Machines.PSObject.Properties[$hn]) { $machineList = @($jobj.Machines.$hn) }
-            if ($jobj.Exceptions -and $jobj.Exceptions.PSObject.Properties[$hn]) { $exceptions = @($jobj.Exceptions.$hn) }
-            $excSet = @{}; foreach ($x in $exceptions) { $excSet["$x".ToLower()] = $true }
-            foreach ($x in $globalList) { if (-not $excSet.ContainsKey("$x".ToLower())) { $ifeoPatterns += $x } }
-            foreach ($x in $machineList) { $ifeoPatterns += $x }
-        } catch { Write-InstallLog "Parse IFEO list falhou: $($_.Exception.Message)" "WARN" }
-    }
-    if ($ifeoPatterns.Count -gt 0) {
-        $ifeoRoot = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
-        $ifeoDbg  = "$env:SystemRoot\System32\systray.exe"
-        $nonIfeo = @("winstore.app","gamebar","gamingoverlay","gamingapp","yourphone","cortana","bingweather","bingnews","bingsports","bingfinance","people","windowsmaps","windowsalarms","gethelp","feedback","clipchamp","todoapp","windowsterminal","xboxapp","solitaire","minecraft","photos","movies","camera","calculatorapp","paintapp","notepadapp","groove","chrome")
-        $specialMap = @{ "wt"="WindowsTerminal.exe"; "push"="pwsh.exe"; "battle.net"="Battle.net.exe"; "epicgameslauncher"="EpicGamesLauncher.exe" }
-        $applied = 0
-        foreach ($pat in ($ifeoPatterns | Select-Object -Unique)) {
-            $p = ([string]$pat).Trim().ToLower()
-            if ([string]::IsNullOrWhiteSpace($p)) { continue }
-            if ($nonIfeo -contains $p) { continue }
-            $exe = if ($specialMap.ContainsKey($p)) { $specialMap[$p] } elseif ($p -like "*.exe") { $p } else { "$p.exe" }
-            $kp = Join-Path $ifeoRoot $exe
-            try {
-                if (-not (Test-Path $kp)) { New-Item -Path $kp -Force | Out-Null }
-                Set-ItemProperty -Path $kp -Name "Debugger" -Value $ifeoDbg -Force
-                Set-ItemProperty -Path $kp -Name "WinSysMonBlock" -Value 1 -Type DWord -Force
-                $applied++
-            } catch { Write-InstallLog "IFEO '$exe' falhou: $($_.Exception.Message)" "WARN" }
-        }
-        Write-InstallLog "IFEO aplicado: $applied entradas (rede de seguranca - bloqueia mesmo sem servico)"
-    }
+    $ifeoCount2 = Apply-IFEOEarly -JsonPath $SharePath
+    Write-InstallLog "IFEO re-aplicado ao final do install: $ifeoCount2 entradas"
 } catch { Write-InstallLog "IFEO setup falhou: $($_.Exception.Message)" "WARN" }
 
 # ---- Iniciar servico com retry ----
