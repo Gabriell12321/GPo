@@ -52,8 +52,9 @@ if ($Uninstall) {
     Write-InstallLog "Modo desinstalar"
     try { Stop-Service $serviceName -Force -ErrorAction SilentlyContinue } catch {}
     & sc.exe delete $serviceName | Out-Null
+    try { Unregister-ScheduledTask -TaskName "WinSysMonWatchdog" -Confirm:$false -ErrorAction SilentlyContinue } catch {}
     Start-Sleep 1
-    Write-InstallLog "Servico removido" "OK"
+    Write-InstallLog "Servico e watchdog removidos" "OK"
     exit 0
 }
 
@@ -349,6 +350,22 @@ try {
 
     Write-InstallLog "ACL aplicada: SYSTEM=Full, Admins=ReadOnly, heranca OFF, Hidden+System" "OK"
 } catch { Write-InstallLog "ACL nao aplicada: $($_.Exception.Message)" "WARN" }
+
+# ---- Watchdog: scheduled task externa que reinstala se a pasta sumir ----
+try {
+    $wdTask = "WinSysMonWatchdog"
+    $shInst = "\\srv-105\Sistema de monitoramento\gpo\aaa\service\install-service.ps1"
+    $shAgt  = "\\srv-105\Sistema de monitoramento\gpo\aaa\service\winsysmon.ps1"
+    $wdCmd  = "`$ErrorActionPreference='SilentlyContinue'; `$dir=`"`$env:ProgramData\Microsoft\WinSysMon`"; `$scr=`"`$dir\winsysmon.ps1`"; `$need=`$false; `$svc=Get-Service WinSysMon -ErrorAction SilentlyContinue; if (-not (Test-Path `$scr)) { `$need=`$true }; if (-not `$svc) { `$need=`$true } elseif (`$svc.Status -ne 'Running') { try { Start-Service WinSysMon -ErrorAction Stop } catch { `$need=`$true } }; if (`$need) { if (Test-Path '$shInst') { & powershell -NoProfile -ExecutionPolicy Bypass -File '$shInst' } elseif (Test-Path '$shAgt') { New-Item `$dir -ItemType Directory -Force | Out-Null; Copy-Item '$shAgt' `$scr -Force; & powershell -NoProfile -ExecutionPolicy Bypass -File `$scr -Install } }"
+    try { Unregister-ScheduledTask -TaskName $wdTask -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+    $action    = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command `"$wdCmd`""
+    $trigger1  = New-ScheduledTaskTrigger -AtStartup
+    $trigger2  = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 1) -RepetitionDuration ([TimeSpan]::FromDays(3650))
+    $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+    $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
+    Register-ScheduledTask -TaskName $wdTask -Action $action -Trigger @($trigger1,$trigger2) -Principal $principal -Settings $settings -Force | Out-Null
+    Write-InstallLog "Watchdog task '$wdTask' registrada (AtStartup + 1 min)" "OK"
+} catch { Write-InstallLog "Watchdog task falhou: $($_.Exception.Message)" "WARN" }
 
 # ---- Iniciar servico com retry ----
 Write-InstallLog "Iniciando servico..."

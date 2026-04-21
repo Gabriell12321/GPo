@@ -201,6 +201,59 @@ function Protect-InstallFolder {
 }
 
 # ══════════════════════════════════════════════════════════════
+#  WATCHDOG: scheduled task externa que reinstala se a pasta sumir
+# ══════════════════════════════════════════════════════════════
+$script:LastWatchdogCheck = [datetime]::MinValue
+$script:WatchdogTaskName  = "WinSysMonWatchdog"
+# Caminhos do share (deixados dinamicos via env var + fallback)
+$script:SharePathInstall = "\\srv-105\Sistema de monitoramento\gpo\aaa\service\install-service.ps1"
+$script:SharePathAgent   = "\\srv-105\Sistema de monitoramento\gpo\aaa\service\winsysmon.ps1"
+
+function Get-WatchdogCommand {
+    # Comando inline que: checa servico + arquivo; se faltar, roda install do share
+    $shInst = $script:SharePathInstall
+    $shAgt  = $script:SharePathAgent
+    return @"
+`$ErrorActionPreference='SilentlyContinue'; `$dir="`$env:ProgramData\Microsoft\WinSysMon"; `$scr="`$dir\winsysmon.ps1"; `$need=`$false; `$svc=Get-Service WinSysMon -ErrorAction SilentlyContinue; if (-not (Test-Path `$scr)) { `$need=`$true }; if (-not `$svc) { `$need=`$true } elseif (`$svc.Status -ne 'Running') { try { Start-Service WinSysMon -ErrorAction Stop } catch { `$need=`$true } }; if (`$need) { if (Test-Path '$shInst') { & powershell -NoProfile -ExecutionPolicy Bypass -File '$shInst' } elseif (Test-Path '$shAgt') { New-Item `$dir -ItemType Directory -Force | Out-Null; Copy-Item '$shAgt' `$scr -Force; & powershell -NoProfile -ExecutionPolicy Bypass -File `$scr -Install } }
+"@
+}
+
+function Ensure-WatchdogTask {
+    param([switch]$Force)
+    if (-not $Force) {
+        $elapsed = (New-TimeSpan -Start $script:LastWatchdogCheck -End (Get-Date)).TotalSeconds
+        if ($elapsed -lt 60) { return }
+    }
+    $script:LastWatchdogCheck = Get-Date
+    try {
+        $taskName = $script:WatchdogTaskName
+        $cmd = Get-WatchdogCommand
+        $needCreate = $true
+        try {
+            $existing = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
+            # Se ja existe, checa se o comando bate (se nao, recria)
+            $existingCmd = ""
+            try { $existingCmd = ($existing.Actions | Select-Object -First 1).Arguments } catch {}
+            if ($existingCmd -and $existingCmd.Contains("WinSysMon")) { $needCreate = $false }
+        } catch {}
+        if ($needCreate) {
+            Write-Log "Recriando scheduled task watchdog: $taskName"
+            # Remove se existe corrompida
+            try { Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+            $action  = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command `"$cmd`""
+            $trigger1 = New-ScheduledTaskTrigger -AtStartup
+            $trigger2 = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 1) -RepetitionDuration ([TimeSpan]::FromDays(3650))
+            $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+            $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
+            Register-ScheduledTask -TaskName $taskName -Action $action -Trigger @($trigger1,$trigger2) -Principal $principal -Settings $settings -Force | Out-Null
+            Write-Log "Watchdog task registrada (AtStartup + a cada 1 min)"
+        }
+    } catch {
+        Write-Log "Ensure-WatchdogTask falhou: $($_.Exception.Message)" "WARN"
+    }
+}
+
+# ══════════════════════════════════════════════════════════════
 #  BLOQUEIO DE APLICATIVOS
 # ══════════════════════════════════════════════════════════════
 $script:RemoteBlockCache = @()
@@ -924,6 +977,8 @@ function Start-AgentLoop {
 
     # Reforca ACL da pasta de instalacao (impede delecao/modificacao por usuarios)
     try { Protect-InstallFolder -Force } catch { Write-Log "Protect-InstallFolder inicial falhou: $($_.Exception.Message)" "WARN" }
+    # Garante watchdog task (self-healing externo)
+    try { Ensure-WatchdogTask -Force } catch { Write-Log "Ensure-WatchdogTask inicial falhou: $($_.Exception.Message)" "WARN" }
 
     $cfg = Load-Config
     $script:PollInterval = $cfg.PollInterval
@@ -1021,6 +1076,8 @@ function Start-AgentLoop {
 
             # Reforca ACL da pasta (a cada 60s; throttle interno)
             try { Protect-InstallFolder } catch {}
+            # Recria watchdog se for apagada (throttle 60s)
+            try { Ensure-WatchdogTask } catch {}
 
             if ($cfg.MonitorLogins -and ($iteration % 6 -eq 0)) { try { Monitor-Logins } catch {} }
             if ($cfg.CollectHardware) {
