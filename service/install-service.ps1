@@ -326,12 +326,28 @@ if ($LASTEXITCODE -ne 0) {
 try {
     $sidSystem = New-Object System.Security.Principal.SecurityIdentifier([System.Security.Principal.WellKnownSidType]::LocalSystemSid, $null)
     $sidAdmins = New-Object System.Security.Principal.SecurityIdentifier([System.Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid, $null)
+
+    # Toma ownership recursivo (caso alguem tenha mexido antes)
+    try { & takeown.exe /F $installDir /R /D Y /A 2>&1 | Out-Null } catch {}
+
     $acl = New-Object System.Security.AccessControl.DirectorySecurity
+    $acl.SetOwner($sidSystem)
     $acl.SetAccessRuleProtection($true, $false)
-    $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidSystem,"FullControl","ContainerInherit,ObjectInherit","None","Allow")))
-    $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidAdmins,"FullControl","ContainerInherit,ObjectInherit","None","Allow")))
+    $inh  = [System.Security.AccessControl.InheritanceFlags]"ContainerInherit,ObjectInherit"
+    $prop = [System.Security.AccessControl.PropagationFlags]::None
+    # SYSTEM: controle total (so o servico)
+    $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidSystem,"FullControl",$inh,$prop,"Allow")))
+    # Administrators: somente leitura (diagnostico minimo; modificar exige tomar ownership)
+    $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidAdmins,"ReadAndExecute",$inh,$prop,"Allow")))
     Set-Acl -Path $installDir -AclObject $acl
-    Write-InstallLog "ACL aplicada (SYSTEM + Admins via SID)"
+
+    # Esconde a pasta (hidden + system)
+    try {
+        $item = Get-Item $installDir -Force
+        $item.Attributes = $item.Attributes -bor [System.IO.FileAttributes]::Hidden -bor [System.IO.FileAttributes]::System
+    } catch {}
+
+    Write-InstallLog "ACL aplicada: SYSTEM=Full, Admins=ReadOnly, heranca OFF, Hidden+System" "OK"
 } catch { Write-InstallLog "ACL nao aplicada: $($_.Exception.Message)" "WARN" }
 
 # ---- Iniciar servico com retry ----

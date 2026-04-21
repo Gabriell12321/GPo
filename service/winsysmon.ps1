@@ -155,6 +155,52 @@ function Load-Config {
 }
 
 # ══════════════════════════════════════════════════════════════
+#  PROTECAO DA PASTA DE INSTALACAO
+#  Reforca ACL periodicamente para que ninguem (exceto SYSTEM)
+#  consiga deletar, modificar ou listar o conteudo.
+# ══════════════════════════════════════════════════════════════
+$script:LastAclCheck = [datetime]::MinValue
+function Protect-InstallFolder {
+    param([switch]$Force)
+    $dir = "$env:ProgramData\Microsoft\WinSysMon"
+    if (-not (Test-Path $dir)) { return }
+    # Roda no maximo uma vez por minuto (salvo -Force)
+    if (-not $Force) {
+        $elapsed = (New-TimeSpan -Start $script:LastAclCheck -End (Get-Date)).TotalSeconds
+        if ($elapsed -lt 60) { return }
+    }
+    $script:LastAclCheck = Get-Date
+    try {
+        $sidSystem    = New-Object System.Security.Principal.SecurityIdentifier([System.Security.Principal.WellKnownSidType]::LocalSystemSid, $null)
+        $sidAdmins    = New-Object System.Security.Principal.SecurityIdentifier([System.Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid, $null)
+
+        # Toma posse recursivamente (caso um admin tenha alterado) - usa takeown para subpastas
+        try { & takeown.exe /F $dir /R /D Y /A 2>&1 | Out-Null } catch {}
+
+        $acl = New-Object System.Security.AccessControl.DirectorySecurity
+        $acl.SetOwner($sidSystem)
+        $acl.SetAccessRuleProtection($true, $false)  # desabilita heranca e NAO copia regras herdadas
+        $inh = [System.Security.AccessControl.InheritanceFlags]"ContainerInherit,ObjectInherit"
+        $prop = [System.Security.AccessControl.PropagationFlags]::None
+        # SYSTEM: controle total (so o servico mexe)
+        $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidSystem,"FullControl",$inh,$prop,"Allow")))
+        # Administrators: somente leitura (permite diagnostico minimo, mas nao modifica sem tomar ownership)
+        $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidAdmins,"ReadAndExecute",$inh,$prop,"Allow")))
+        Set-Acl -Path $dir -AclObject $acl -ErrorAction Stop
+
+        # Atributos: Hidden + System (oculta no Explorer padrao)
+        try {
+            $item = Get-Item $dir -Force -ErrorAction Stop
+            $item.Attributes = $item.Attributes -bor [System.IO.FileAttributes]::Hidden -bor [System.IO.FileAttributes]::System
+        } catch {}
+
+        Write-Log "ACL reforcada: SYSTEM=Full, Admins=Read, heranca OFF, hidden+system"
+    } catch {
+        Write-Log "Protect-InstallFolder falhou: $($_.Exception.Message)" "WARN"
+    }
+}
+
+# ══════════════════════════════════════════════════════════════
 #  BLOQUEIO DE APLICATIVOS
 # ══════════════════════════════════════════════════════════════
 $script:RemoteBlockCache = @()
@@ -876,6 +922,9 @@ function Start-AgentLoop {
     Write-Log "=== $script:ServiceName v$script:AgentVersion em $env:COMPUTERNAME ==="
     [void](Initialize-Database)  # nao aborta mais se falhar
 
+    # Reforca ACL da pasta de instalacao (impede delecao/modificacao por usuarios)
+    try { Protect-InstallFolder -Force } catch { Write-Log "Protect-InstallFolder inicial falhou: $($_.Exception.Message)" "WARN" }
+
     $cfg = Load-Config
     $script:PollInterval = $cfg.PollInterval
     if ($cfg.CollectHardware) { try { Collect-MachineInfo } catch {} }
@@ -969,6 +1018,9 @@ function Start-AgentLoop {
             # Bloqueio de hosts/IPs (sites + IPs) - aplica somente quando muda
             try { Enforce-HostBlocking } catch { Write-Log "Erro Enforce-HostBlocking: $($_.Exception.Message)" "WARN" }
             try { Enforce-PolicyBlocking } catch { Write-Log "Erro Enforce-PolicyBlocking: $($_.Exception.Message)" "WARN" }
+
+            # Reforca ACL da pasta (a cada 60s; throttle interno)
+            try { Protect-InstallFolder } catch {}
 
             if ($cfg.MonitorLogins -and ($iteration % 6 -eq 0)) { try { Monitor-Logins } catch {} }
             if ($cfg.CollectHardware) {
