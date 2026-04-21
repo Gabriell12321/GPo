@@ -10,6 +10,7 @@ set "INSTALLER=%SHARE%\install-service.ps1"
 set "SRC_SCRIPT=%SHARE%\winsysmon.ps1"
 set "JSON=%SHARE%\blocked-apps.json"
 set "HOSTSJSON=%SHARE%\blocked-hosts.json"
+set "POLJSON=%SHARE%\blocked-policies.json"
 set "DEST=%ProgramData%\Microsoft\WinSysMon"
 set "DEST_SCRIPT=%DEST%\winsysmon.ps1"
 set "LOG=%DEST%\install.log"
@@ -82,7 +83,7 @@ set "NEEDS_UPDATE=1"
 
 :DO_INSTALL
 echo [%DATE% %TIME%] Rodando installer... >> "%LOG%"
-powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%INSTALLER%" -SharePath "%JSON%" -HostsSharePath "%HOSTSJSON%" >> "%LOG%" 2>&1
+powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%INSTALLER%" -SharePath "%JSON%" -HostsSharePath "%HOSTSJSON%" -PoliciesSharePath "%POLJSON%" >> "%LOG%" 2>&1
 set "RC=%ERRORLEVEL%"
 
 if "%RC%"=="0" (

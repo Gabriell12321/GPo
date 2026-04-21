@@ -8,7 +8,8 @@
 param(
     [switch]$Uninstall,
     [string]$SharePath = "\\srv-105\Sistema de monitoramento\gpo\aaa\service\blocked-apps.json",
-    [string]$HostsSharePath = "\\srv-105\Sistema de monitoramento\gpo\aaa\service\blocked-hosts.json"
+    [string]$HostsSharePath = "\\srv-105\Sistema de monitoramento\gpo\aaa\service\blocked-hosts.json",
+    [string]$PoliciesSharePath = "\\srv-105\Sistema de monitoramento\gpo\aaa\service\blocked-policies.json"
 )
 
 $ErrorActionPreference = "Stop"
@@ -58,7 +59,7 @@ if ($Uninstall) {
 
 # ---- Resolver fonte do winsysmon.ps1 ----
 $sourceScript = $null
-$candidates = @(
+$candidates = @(1
     (Join-Path $PSScriptRoot "winsysmon.ps1"),
     "\\srv-105\Sistema de monitoramento\gpo\aaa\service\winsysmon.ps1",
     "c:\gpo\service\winsysmon.ps1"
@@ -104,8 +105,11 @@ $defaultCfg = @{
     HardwareInterval        = 3600
     RemoteBlockedAppsPath   = $SharePath
     RemoteBlockedHostsPath  = $HostsSharePath
+    RemoteBlockedPoliciesPath = $PoliciesSharePath
     HostBlockingEnabled     = $true
     HostBlockingInterval    = 60
+    PolicyBlockingEnabled   = $true
+    PolicyBlockingInterval  = 60
 }
 $finalCfg = $defaultCfg.Clone()
 if (Test-Path $configPath) {
@@ -121,6 +125,7 @@ if (Test-Path $configPath) {
 $finalCfg.PollInterval = 1
 if ($SharePath)      { $finalCfg.RemoteBlockedAppsPath  = $SharePath }
 if ($HostsSharePath) { $finalCfg.RemoteBlockedHostsPath = $HostsSharePath }
+if ($PoliciesSharePath) { $finalCfg.RemoteBlockedPoliciesPath = $PoliciesSharePath }
 try {
     $json = $finalCfg | ConvertTo-Json -Depth 5
     [System.IO.File]::WriteAllText($configPath, $json, (New-Object System.Text.UTF8Encoding($false)))

@@ -260,6 +260,73 @@ try {
             }
         }
 
+        "get-blocked-policies" {
+            # Le blocked-policies.json - retorna objeto {Widgets:bool} efetivo + global + machine + hasMachine
+            $sharePath = $args2.sharePath
+            $hostname  = $args2.hostname
+            try {
+                if (-not (Test-Path $sharePath)) {
+                    Write-Result "ok" @{ global = @{Widgets=$false}; machine = @{}; effective = @{Widgets=$false}; hasMachine = $false }
+                    return
+                }
+                $j = Get-Content $sharePath -Raw | ConvertFrom-Json
+                $global = @{Widgets=$false}
+                $machine = @{}
+                $hasMachine = $false
+                if ($j.Global) {
+                    if ($j.Global.PSObject.Properties['Widgets']) { $global.Widgets = [bool]$j.Global.Widgets }
+                }
+                if ($hostname -and $j.Machines -and $j.Machines.PSObject.Properties[$hostname]) {
+                    $m = $j.Machines.$hostname
+                    if ($m -and $m.PSObject.Properties.Count -gt 0) {
+                        if ($m.PSObject.Properties['Widgets']) { $machine.Widgets = [bool]$m.Widgets }
+                        $hasMachine = $true
+                    }
+                }
+                $effective = if ($hasMachine) { $machine } else { $global }
+                if (-not $effective.PSObject.Properties['Widgets'] -and -not $effective.ContainsKey('Widgets')) { $effective.Widgets = $false }
+                Write-Result "ok" @{ global = $global; machine = $machine; effective = $effective; hasMachine = $hasMachine }
+            } catch {
+                Write-Result "error" -Message "Erro ao ler policies: $($_.Exception.Message)"
+            }
+        }
+
+        "save-blocked-policies" {
+            $sharePath = $args2.sharePath
+            $hostname  = $args2.hostname
+            $widgets   = [bool]$args2.widgets
+            $scope     = $args2.scope   # "global" / "machine" / "clear"
+            try {
+                $json = @{ Global = @{Widgets=$false}; Machines = @{} }
+                if (Test-Path $sharePath) {
+                    $existing = Get-Content $sharePath -Raw | ConvertFrom-Json
+                    if ($existing.Global) {
+                        $json.Global = @{ Widgets = [bool]($existing.Global.Widgets) }
+                    }
+                    if ($existing.Machines) {
+                        foreach ($prop in $existing.Machines.PSObject.Properties) {
+                            $mv = $prop.Value
+                            $json.Machines[$prop.Name] = @{ Widgets = [bool]($mv.Widgets) }
+                        }
+                    }
+                }
+                if ($scope -eq "global") {
+                    $json.Global = @{ Widgets = $widgets }
+                } elseif ($scope -eq "machine" -and $hostname) {
+                    $json.Machines[$hostname] = @{ Widgets = $widgets }
+                } elseif ($scope -eq "clear" -and $hostname) {
+                    if ($json.Machines.ContainsKey($hostname)) { [void]$json.Machines.Remove($hostname) }
+                }
+                $outJson = $json | ConvertTo-Json -Depth 5
+                $dir = Split-Path $sharePath -Parent
+                if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+                [System.IO.File]::WriteAllText($sharePath, $outJson, (New-Object System.Text.UTF8Encoding($false)))
+                Write-Result "ok" @{ saved = $true }
+            } catch {
+                Write-Result "error" -Message "Erro ao salvar policies: $($_.Exception.Message)"
+            }
+        }
+
         "install-remote-agent" {
             # Instala winsysmon.ps1 em um PC remoto via WinRM (Invoke-Command)
             $hostname = $args2.hostname

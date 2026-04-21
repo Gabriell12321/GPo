@@ -10,6 +10,7 @@ class Main extends hxd.App {
     static var DEFAULT_USER:String = "";
     static var SHARE_PATH:String = "";
     static var HOSTS_SHARE_PATH:String = "";
+    static var POLICIES_SHARE_PATH:String = "";
 
     // State
     var screen:String = "login";
@@ -69,6 +70,12 @@ class Main extends hxd.App {
     var hostInputBorder:Graphics;
     var editingHostInput:Bool = false;
     var hostStatusText:Text;
+
+    // Politicas Extras (Widgets/Noticias)
+    var policyLayer:h2d.Object;
+    var policyWidgets:Bool = false;
+    var policyStatusText:Text;
+    var policyHasMachine:Bool = false;
 
     // Hyper-V Manager
     var hvHost:String = "";
@@ -284,11 +291,16 @@ class Main extends hxd.App {
                 if (rp != null && rp.length > 0) SHARE_PATH = rp;
                 var rh:String = Reflect.field(cfg, "RemoteBlockedHostsPath");
                 if (rh != null && rh.length > 0) HOSTS_SHARE_PATH = rh;
+                var rpol:String = Reflect.field(cfg, "RemoteBlockedPoliciesPath");
+                if (rpol != null && rpol.length > 0) POLICIES_SHARE_PATH = rpol;
             }
         } catch(_:Dynamic) {}
         // Fallback: deriva de SHARE_PATH trocando blocked-apps.json -> blocked-hosts.json
         if (HOSTS_SHARE_PATH.length == 0 && SHARE_PATH.length > 0) {
             HOSTS_SHARE_PATH = StringTools.replace(SHARE_PATH, "blocked-apps.json", "blocked-hosts.json");
+        }
+        if (POLICIES_SHARE_PATH.length == 0 && SHARE_PATH.length > 0) {
+            POLICIES_SHARE_PATH = StringTools.replace(SHARE_PATH, "blocked-apps.json", "blocked-policies.json");
         }
 
         // Listener global de texto (resolve teclas especiais como . , / - em qualquer layout)
@@ -525,6 +537,7 @@ class Main extends hxd.App {
         makeButton("Remover Agente", 150, 76, 130, 22, function() { uninstallRemoteAgent(pcName); });
         makeButton("Status Agente", 290, 76, 120, 22, function() { checkRemoteAgent(pcName); });
         makeButton("Sites/IPs", 420, 76, 100, 22, function() { showHostBlocking(); });
+        makeButton("Politicas", 530, 76, 100, 22, function() { showPolicyBlocking(); });
         makeButton("Gerar .bat p/ GPO", Std.int(W) - 170, 76, 160, 22, function() { generateGpoBat(); });
 
         appLayer = new h2d.Object(s2d);
@@ -943,8 +956,121 @@ class Main extends hxd.App {
     }
 
     // ═══════════════════════════════════════
-    //  HYPER-V MANAGER
+    //  POLITICAS EXTRAS (Widgets/Noticias Win10+11)
     // ═══════════════════════════════════════
+    function policiesSharePath():String {
+        if (POLICIES_SHARE_PATH.length > 0) return POLICIES_SHARE_PATH;
+        if (SHARE_PATH.length > 0) return StringTools.replace(SHARE_PATH, "blocked-apps.json", "blocked-policies.json");
+        return "service/blocked-policies.json";
+    }
+
+    function showPolicyBlocking() {
+        screen = "policies";
+        s2d.removeChildren();
+
+        var pcName:String = Reflect.field(selectedPC, "name");
+        drawHeader("Politicas Extras - " + pcName);
+
+        makeButton("< Voltar", 10, 46, 70, 22, function() { showAppBlocking(); });
+
+        makeButton("Salvar Global", Std.int(W) - 420, 46, 120, 22, function() { savePolicies("global"); });
+        makeButton("Salvar p/ PC",  Std.int(W) - 290, 46, 120, 22, function() { savePolicies("machine"); });
+        makeButton("Usar Global",   Std.int(W) - 160, 46, 120, 22, function() { savePolicies("clear"); });
+
+        policyStatusText = makeText("", 1.2, 0xA6E3A1);
+        policyStatusText.x = 10; policyStatusText.y = 78;
+
+        policyLayer = new h2d.Object(s2d);
+        policyLayer.x = 10; policyLayer.y = 110;
+
+        loadBlockedPolicies(pcName);
+        renderPolicyList();
+    }
+
+    function loadBlockedPolicies(pcName:String) {
+        policyWidgets = false;
+        policyHasMachine = false;
+        var result = runBridge("get-blocked-policies", {sharePath: policiesSharePath(), hostname: pcName});
+        if (result != null && Reflect.field(result, "status") == "ok") {
+            var data:Dynamic = Reflect.field(result, "data");
+            var eff:Dynamic = Reflect.field(data, "effective");
+            if (eff != null) {
+                var w:Dynamic = Reflect.field(eff, "Widgets");
+                if (w != null) policyWidgets = (w == true || Std.string(w) == "True" || Std.string(w) == "true" || w == 1);
+            }
+            var hm:Dynamic = Reflect.field(data, "hasMachine");
+            if (hm != null) policyHasMachine = (hm == true || Std.string(hm) == "True");
+        }
+    }
+
+    function renderPolicyList() {
+        if (policyLayer == null) return;
+        policyLayer.removeChildren();
+        var w = W - 20;
+
+        // Header
+        var hdr = new Graphics(policyLayer);
+        hdr.beginFill(0x45475A); hdr.drawRect(0, 0, w, 22); hdr.endFill();
+        addLayerText(policyLayer, "Politica / Ajuste", 10, 3, 1.2, 0xCDD6F4);
+        addLayerText(policyLayer, "Escopo atual", Std.int(w) - 320, 3, 1.2, 0xCDD6F4);
+        addLayerText(policyLayer, "Ativo?", Std.int(w) - 90, 3, 1.2, 0xCDD6F4);
+
+        var y:Float = 30;
+
+        // Widgets row
+        var rowBg = new Graphics(policyLayer);
+        rowBg.beginFill(0x313244); rowBg.drawRect(0, y, w, 56); rowBg.endFill();
+
+        addLayerText(policyLayer, "Bloquear Widgets / Noticias do Windows", 10, y + 4, 1.3, 0xF38BA8);
+        addLayerText(policyLayer, "- Remove o icone de Widgets (Win11) e News and Interests (Win10)", 10, y + 22, 1.0, 0xCDD6F4);
+        addLayerText(policyLayer, "- Aplica Registry.pol + mata processos Widgets.exe / WidgetService.exe", 10, y + 36, 1.0, 0xCDD6F4);
+
+        var scopeLabel = policyHasMachine ? "Override PC" : "Herda Global";
+        var scopeColor = policyHasMachine ? 0xFAB387 : 0x89DCEB;
+        addLayerText(policyLayer, scopeLabel, Std.int(w) - 320, y + 18, 1.1, scopeColor);
+
+        // Toggle visual
+        var boxX = Std.int(w) - 80;
+        var boxY = Std.int(y) + 16;
+        var box = new Graphics(policyLayer);
+        var bgCol = policyWidgets ? 0xA6E3A1 : 0x585B70;
+        box.beginFill(bgCol); box.drawRect(boxX, boxY, 60, 24); box.endFill();
+        var knobX = policyWidgets ? boxX + 38 : boxX + 2;
+        box.beginFill(0x1E1E2E); box.drawRect(knobX, boxY + 2, 20, 20); box.endFill();
+        addLayerText(policyLayer, policyWidgets ? "SIM" : "NAO", boxX + (policyWidgets ? 6 : 30), boxY + 4, 1.0, policyWidgets ? 0x1E1E2E : 0xCDD6F4);
+
+        var it = new Interactive(60, 24, policyLayer);
+        it.x = boxX; it.y = boxY; it.cursor = Button;
+        it.onClick = function(_) { policyWidgets = !policyWidgets; renderPolicyList(); };
+    }
+
+    function savePolicies(scope:String) {
+        var pcName:String = Reflect.field(selectedPC, "name");
+        var result = runBridge("save-blocked-policies", {
+            sharePath: policiesSharePath(),
+            hostname: pcName,
+            widgets: policyWidgets,
+            scope: scope
+        });
+        if (result != null && Reflect.field(result, "status") == "ok") {
+            var label = switch (scope) { case "global": "GLOBAL"; case "clear": "HERDANDO GLOBAL"; default: pcName; };
+            if (policyStatusText != null) {
+                if (scope == "clear") {
+                    policyStatusText.text = "Override removido - " + pcName + " agora usa lista GLOBAL";
+                    loadBlockedPolicies(pcName);
+                    renderPolicyList();
+                } else {
+                    policyStatusText.text = "Salvo (" + label + "): Widgets=" + (policyWidgets ? "BLOQUEADO" : "LIBERADO") + "  (aplica em ate 60s)";
+                }
+                policyStatusText.textColor = 0xA6E3A1;
+            }
+        } else {
+            var msg = result != null ? Std.string(Reflect.field(result, "message")) : "bridge falhou";
+            if (policyStatusText != null) { policyStatusText.text = "Erro: " + msg; policyStatusText.textColor = 0xF38BA8; }
+        }
+    }
+
+
     function setHvStatus(msg:String, color:Int) {
         if (hvStatusText != null) { hvStatusText.text = msg; hvStatusText.textColor = color; }
     }

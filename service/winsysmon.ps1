@@ -144,7 +144,7 @@ function Invoke-Sql {
 #  CONFIGURACAO
 # ══════════════════════════════════════════════════════════════
 function Load-Config {
-    $default = @{ BlockedApps=@(); PollInterval=1; MonitorLogins=$true; MonitorApps=$true; CollectHardware=$true; HardwareInterval=3600; RemoteBlockedAppsPath=""; RemoteBlockedHostsPath=""; HostBlockingEnabled=$true; HostBlockingInterval=60 }
+    $default = @{ BlockedApps=@(); PollInterval=1; MonitorLogins=$true; MonitorApps=$true; CollectHardware=$true; HardwareInterval=3600; RemoteBlockedAppsPath=""; RemoteBlockedHostsPath=""; HostBlockingEnabled=$true; HostBlockingInterval=60; RemoteBlockedPoliciesPath=""; PolicyBlockingEnabled=$true; PolicyBlockingInterval=60 }
     if (Test-Path $script:ConfigPath) {
         try {
             $json = Get-Content $script:ConfigPath -Raw | ConvertFrom-Json
@@ -542,6 +542,122 @@ function Clear-HostBlocking {
 }
 
 # ══════════════════════════════════════════════════════════════
+#  BLOQUEIO DE POLITICAS EXTRAS (Widgets/Noticias Win10+11)
+# ══════════════════════════════════════════════════════════════
+$script:RemotePoliciesCache = $null
+$script:LastPoliciesFetch = [datetime]::MinValue
+$script:LastPoliciesApplied = ""
+
+function Get-BlockedPolicies {
+    # Le blocked-policies.json - modelo {Global:{Widgets:bool}, Machines:{PC:{Widgets:bool}}}
+    $cfg = Load-Config
+    $path = $cfg.RemoteBlockedPoliciesPath
+    if (-not $path) { return @{ Widgets = $false } }
+
+    $interval = [int]$cfg.PolicyBlockingInterval; if ($interval -le 0) { $interval = 60 }
+    $elapsed = (New-TimeSpan -Start $script:LastPoliciesFetch -End (Get-Date)).TotalSeconds
+    if ($script:RemotePoliciesCache -and $elapsed -lt $interval) { return $script:RemotePoliciesCache }
+
+    $result = @{ Widgets = $false }
+    try {
+        if (Test-Path $path -ErrorAction Stop) {
+            $j = Get-Content $path -Raw -ErrorAction Stop | ConvertFrom-Json
+            $hostname = $env:COMPUTERNAME
+            $effective = $null
+            # Override: Machine nao-vazio > Global
+            if ($j.Machines -and $j.Machines.PSObject.Properties[$hostname]) {
+                $m = $j.Machines.$hostname
+                # "nao-vazio" aqui = objeto com pelo menos uma propriedade
+                if ($m -and $m.PSObject.Properties.Count -gt 0) { $effective = $m }
+            }
+            if (-not $effective -and $j.Global) { $effective = $j.Global }
+            if ($effective) {
+                if ($effective.PSObject.Properties['Widgets']) { $result.Widgets = [bool]$effective.Widgets }
+            }
+            $script:RemotePoliciesCache = $result
+            $script:LastPoliciesFetch = Get-Date
+        }
+    } catch {
+        Write-Log "Erro ao ler policies share: $($_.Exception.Message)" "WARN"
+    }
+    return $result
+}
+
+function Set-RegistryValue {
+    param([string]$Path, [string]$Name, $Value, [string]$Type = "DWord")
+    try {
+        if (-not (Test-Path $Path)) { New-Item -Path $Path -Force | Out-Null }
+        Set-ItemProperty -Path $Path -Name $Name -Value $Value -Type $Type -Force -ErrorAction Stop
+        return $true
+    } catch { return $false }
+}
+
+function Remove-RegistryValue {
+    param([string]$Path, [string]$Name)
+    try {
+        if (Test-Path $Path) { Remove-ItemProperty -Path $Path -Name $Name -Force -ErrorAction SilentlyContinue }
+    } catch {}
+}
+
+function Apply-WidgetsBlocking {
+    param([bool]$Block)
+
+    # Win11 Widgets (News and Interests / Dsh)
+    $dshPath = "HKLM:\Software\Policies\Microsoft\Dsh"
+    # Win10 News and Interests (Windows Feeds)
+    $feedsPath = "HKLM:\Software\Policies\Microsoft\Windows\Windows Feeds"
+    # Registry.pol-equivalente via PolicyManager
+    $pmPath = "HKLM:\Software\Microsoft\PolicyManager\default\NewsAndInterests\AllowNewsAndInterests"
+
+    if ($Block) {
+        Set-RegistryValue -Path $dshPath   -Name "AllowNewsAndInterests" -Value 0
+        Set-RegistryValue -Path $feedsPath -Name "EnableFeeds"           -Value 0
+        Set-RegistryValue -Path $feedsPath -Name "ShellFeedsTaskbarViewMode" -Value 2
+        Set-RegistryValue -Path $pmPath    -Name "value" -Value 0
+        # Remover Widgets via AppX Package - Win11
+        try {
+            $wp = Get-AppxPackage -AllUsers -Name "MicrosoftWindows.Client.WebExperience" -ErrorAction SilentlyContinue
+            if ($wp) {
+                foreach ($p in $wp) { try { Remove-AppxPackage -AllUsers -Package $p.PackageFullName -ErrorAction SilentlyContinue } catch {} }
+            }
+        } catch {}
+        # Mata processos ativos (Widgets.exe, WidgetService.exe)
+        Get-Process -Name "Widgets","WidgetService" -ErrorAction SilentlyContinue | ForEach-Object {
+            try { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue } catch {}
+        }
+        # Forca re-render da taskbar para todos os usuarios logados
+        Get-Process -Name "explorer" -ErrorAction SilentlyContinue | ForEach-Object {
+            try { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue } catch {}
+        }
+        Write-Log "Widgets/Noticias: BLOQUEADO (Win10/11)"
+    } else {
+        Remove-RegistryValue -Path $dshPath   -Name "AllowNewsAndInterests"
+        Remove-RegistryValue -Path $feedsPath -Name "EnableFeeds"
+        Remove-RegistryValue -Path $feedsPath -Name "ShellFeedsTaskbarViewMode"
+        Remove-RegistryValue -Path $pmPath    -Name "value"
+        Write-Log "Widgets/Noticias: LIBERADO"
+    }
+}
+
+function Enforce-PolicyBlocking {
+    try {
+        $pol = Get-BlockedPolicies
+    } catch { return }
+
+    $sig = "W=$($pol.Widgets)"
+    if ($sig -eq $script:LastPoliciesApplied) { return }
+
+    Apply-WidgetsBlocking -Block ([bool]$pol.Widgets)
+
+    $script:LastPoliciesApplied = $sig
+}
+
+function Clear-PolicyBlocking {
+    # Usado no Uninstall - restaura tudo
+    try { Apply-WidgetsBlocking -Block $false } catch {}
+}
+
+# ══════════════════════════════════════════════════════════════
 #  MONITORAMENTO DE LOGINS
 # ══════════════════════════════════════════════════════════════
 $script:LastLoginCheck = (Get-Date)
@@ -610,7 +726,7 @@ function Install-Agent {
     $destCfg = Join-Path $installDir "sysmon-config.json"
 
     # Mergear config existente (preserva) com novos campos
-    $cfgObj = @{ BlockedApps=@(); PollInterval=1; MonitorLogins=$true; MonitorApps=$true; CollectHardware=$true; HardwareInterval=3600; RemoteBlockedAppsPath=""; RemoteBlockedHostsPath=""; HostBlockingEnabled=$true; HostBlockingInterval=60 }
+    $cfgObj = @{ BlockedApps=@(); PollInterval=1; MonitorLogins=$true; MonitorApps=$true; CollectHardware=$true; HardwareInterval=3600; RemoteBlockedAppsPath=""; RemoteBlockedHostsPath=""; HostBlockingEnabled=$true; HostBlockingInterval=60; RemoteBlockedPoliciesPath=""; PolicyBlockingEnabled=$true; PolicyBlockingInterval=60 }
     if (Test-Path $destCfg) {
         try {
             $existing = Get-Content $destCfg -Raw | ConvertFrom-Json
@@ -711,6 +827,7 @@ function Uninstall-Agent {
     Unregister-ScheduledTask -TaskName $script:ServiceName -Confirm:$false -ErrorAction SilentlyContinue
     # Limpa bloqueios de host/IP aplicados
     try { Clear-HostBlocking; Write-Host "  Bloqueios de hosts/IPs removidos" -ForegroundColor Gray } catch {}
+    try { Clear-PolicyBlocking; Write-Host "  Politicas (Widgets) restauradas" -ForegroundColor Gray } catch {}
     Write-Host "Removido." -ForegroundColor Green
     Write-Host "  Pasta preservada: $env:ProgramData\Microsoft\WinSysMon" -ForegroundColor Gray
 }
@@ -839,6 +956,7 @@ function Start-AgentLoop {
 
             # Bloqueio de hosts/IPs (sites + IPs) - aplica somente quando muda
             try { Enforce-HostBlocking } catch { Write-Log "Erro Enforce-HostBlocking: $($_.Exception.Message)" "WARN" }
+            try { Enforce-PolicyBlocking } catch { Write-Log "Erro Enforce-PolicyBlocking: $($_.Exception.Message)" "WARN" }
 
             if ($cfg.MonitorLogins -and ($iteration % 6 -eq 0)) { try { Monitor-Logins } catch {} }
             if ($cfg.CollectHardware) {
