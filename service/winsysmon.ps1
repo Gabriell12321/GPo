@@ -1208,6 +1208,20 @@ function Enforce-HostBlocking {
     } catch {}
     $method = $method.ToLower()
 
+    # SAFEGUARD: se WithSecure/F-Secure estiver ativo, FORCA firewall-dns
+    # (evita deteccao "Redirected hosts file" mesmo se config estiver desatualizado)
+    try {
+        foreach ($svcName in @("FSMA","FSDFWD","F-Secure Gatekeeper Handler Starter")) {
+            if (Get-Service -Name $svcName -ErrorAction SilentlyContinue) {
+                if ($method -ne "firewall-dns") {
+                    Write-Log "WithSecure ativo - forcando firewall-dns (override de '$method')" "WARN"
+                    $method = "firewall-dns"
+                }
+                break
+            }
+        }
+    } catch {}
+
     switch ($method) {
         "firewall-dns" {
             # Nao toca no hosts - apenas resolve dominios e bloqueia IPs no firewall
