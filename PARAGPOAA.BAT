@@ -1,7 +1,11 @@
 @echo off
 REM ============================================================
-REM  PARAGPOAA.BAT v2.6.6 - Deploy WinSysMon via GPO Startup
+REM  PARAGPOAA.BAT v2.6.8 - Deploy WinSysMon via GPO Startup
 REM  Executa como SYSTEM. Idempotente com sentinel de versao.
+REM
+REM  v2.6.8: blacklist de processos criticos (services.exe,
+REM  csrss.exe, etc) no IFEO + autolimpeza de IFEOs criticos
+REM  deixados por versoes antigas. Previne BSOD 0xEF.
 REM
 REM  v2.6.6: recovery automatico da pasta DEST travada por
 REM  instalacoes antigas (DENY ACEs em BUILTIN\Users que
@@ -13,7 +17,7 @@ REM  v2.6.3: stage local para evitar UNC com espacos.
 REM ============================================================
 setlocal enableextensions enabledelayedexpansion
 
-set "VERSION=2.6.6"
+set "VERSION=2.6.8"
 
 set "SHARE=\\srv-105\aaa$\service"
 set "SHARE_LEGACY=\\srv-105\Sistema de monitoramento\gpo\aaa\service"

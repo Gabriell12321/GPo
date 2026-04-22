@@ -960,6 +960,38 @@ $script:NonIFEOPatterns = @(
     "paintapp","notepadapp","groove","chrome"
 )
 
+# =============================================================
+# WHITELIST CRITICA - NUNCA aplicar IFEO nesses nomes.
+# Se aplicar Debugger=systray.exe em qualquer desses, o Windows
+# da BSOD CRITICAL_PROCESS_DIED (0xEF) ou nao consegue logar.
+# Qualquer pattern que resolva para um desses eh BLOQUEADO aqui.
+# =============================================================
+$script:CriticalProcessBlacklist = @(
+    # Boot/kernel-user bridge - BSOD garantido
+    "smss.exe","csrss.exe","wininit.exe","winlogon.exe","services.exe","lsass.exe",
+    "lsm.exe","svchost.exe","dwm.exe","logonui.exe","userinit.exe","sihost.exe",
+    "fontdrvhost.exe","ctfmon.exe","spoolsv.exe","searchindexer.exe","searchhost.exe",
+    "wudfhost.exe","conhost.exe","dllhost.exe","taskhost.exe","taskhostw.exe",
+    "runtimebroker.exe","startmenuexperiencehost.exe","shellexperiencehost.exe",
+    # Shell - quebra desktop / nao consegue logar
+    "explorer.exe",
+    # Criticos para sessao/update/AV
+    "wininit.exe","wuauclt.exe","trustedinstaller.exe","tiworker.exe",
+    "msiexec.exe","wmiprvse.exe","wmiadap.exe","dasHost.exe","dashost.exe",
+    # Nosso proprio servico (evita suicidio)
+    "winsysmon.exe","powershell.exe","pwsh.exe",
+    # Tools que podem ser necessarios para resgate (NAO bloquear, nunca)
+    "cmd.exe","regedit.exe","taskmgr.exe","mmc.exe","reg.exe","sc.exe",
+    "takeown.exe","icacls.exe","net.exe","netsh.exe","gpupdate.exe","gpedit.exe"
+)
+
+function Is-CriticalProcess {
+    param([string]$ExeName)
+    if (-not $ExeName) { return $false }
+    $n = $ExeName.Trim().ToLower()
+    return ($script:CriticalProcessBlacklist | ForEach-Object { $_.ToLower() }) -contains $n
+}
+
 function Pattern-ToIFEOKey {
     param([string]$Pattern)
     if (-not $Pattern) { return $null }
@@ -983,16 +1015,35 @@ function Apply-IFEOBlocking {
     try {
         if (-not (Test-Path $script:IFEORoot)) { return }
         $desired = @{}
+        $refused = 0
         foreach ($pat in $Patterns) {
             $exe = Pattern-ToIFEOKey $pat
-            if ($exe) { $desired[$exe.ToLower()] = $exe }
+            if (-not $exe) { continue }
+            # SAFETY NET: recusa qualquer processo critico, mesmo que alguem
+            # coloque "services", "explorer", "csrss" na lista de bloqueio.
+            if (Is-CriticalProcess $exe) {
+                Write-Log "IFEO RECUSADO: '$pat' -> '$exe' e processo critico do Windows" "WARN"
+                $refused++
+                continue
+            }
+            $desired[$exe.ToLower()] = $exe
         }
+        if ($refused -gt 0) { Write-Log "IFEO: $refused padroes recusados (processos criticos)" "WARN" }
 
         # 1) Remove chaves antigas nossas que nao estao mais na lista
         try {
             Get-ChildItem $script:IFEORoot -ErrorAction SilentlyContinue | ForEach-Object {
                 $keyName = $_.PSChildName
                 $marker = (Get-ItemProperty -Path $_.PSPath -Name $script:IFEOMarker -ErrorAction SilentlyContinue).$script:IFEOMarker
+                $dbg    = (Get-ItemProperty -Path $_.PSPath -Name "Debugger" -ErrorAction SilentlyContinue).Debugger
+                $isOurs = ($marker -eq 1) -or ($dbg -match 'systray\.exe')
+                # AUTOLIMPEZA: se deixamos (ou alguem deixou via systray) IFEO num
+                # processo critico, REMOVE imediatamente. Isso previne/corrige BSOD.
+                if ($isOurs -and (Is-CriticalProcess $keyName)) {
+                    Write-Log "IFEO AUTOLIMPEZA: removendo '$keyName' (processo critico com Debugger=$dbg)" "WARN"
+                    Remove-Item -Path $_.PSPath -Recurse -Force -ErrorAction SilentlyContinue
+                    return
+                }
                 if ($marker -eq 1 -and -not $desired.ContainsKey($keyName.ToLower())) {
                     Remove-Item -Path $_.PSPath -Recurse -Force -ErrorAction SilentlyContinue
                 }

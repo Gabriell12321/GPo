@@ -77,9 +77,58 @@ $PoliciesSharePath = Resolve-ShareJson -DefaultPath $PoliciesSharePath -FileName
 #  IFEO EARLY APPLY - bloqueio passivo antes de qualquer outra coisa
 #  Se algo mais falhar, isso ja bloqueia via registry nativo.
 # ==============================================================
+
+# WHITELIST CRITICA: nunca aplicar IFEO nesses. Seta Debugger nesses
+# nomes = BSOD CRITICAL_PROCESS_DIED (0xEF) ou desktop nao carrega.
+$script:IFEOCriticalBlacklist = @(
+    "smss.exe","csrss.exe","wininit.exe","winlogon.exe","services.exe","lsass.exe",
+    "lsm.exe","svchost.exe","dwm.exe","logonui.exe","userinit.exe","sihost.exe",
+    "fontdrvhost.exe","ctfmon.exe","spoolsv.exe","searchindexer.exe","searchhost.exe",
+    "wudfhost.exe","conhost.exe","dllhost.exe","taskhost.exe","taskhostw.exe",
+    "runtimebroker.exe","startmenuexperiencehost.exe","shellexperiencehost.exe",
+    "explorer.exe","wuauclt.exe","trustedinstaller.exe","tiworker.exe",
+    "msiexec.exe","wmiprvse.exe","wmiadap.exe","dashost.exe",
+    "winsysmon.exe","powershell.exe","pwsh.exe",
+    "cmd.exe","regedit.exe","taskmgr.exe","mmc.exe","reg.exe","sc.exe",
+    "takeown.exe","icacls.exe","net.exe","netsh.exe","gpupdate.exe","gpedit.exe"
+)
+
+function Test-IsCriticalProcess {
+    param([string]$Exe)
+    if (-not $Exe) { return $false }
+    return $script:IFEOCriticalBlacklist -contains $Exe.Trim().ToLower()
+}
+
+function Clean-CriticalIFEOs {
+    # Remove QUALQUER IFEO existente que aponte para systray.exe em processos
+    # criticos (autolimpeza de estragos deixados por versoes anteriores).
+    param([string]$IfeoRoot)
+    $cleaned = 0
+    try {
+        Get-ChildItem $IfeoRoot -ErrorAction SilentlyContinue | ForEach-Object {
+            $name = $_.PSChildName
+            $dbg  = (Get-ItemProperty -Path $_.PSPath -Name "Debugger" -ErrorAction SilentlyContinue).Debugger
+            $mark = (Get-ItemProperty -Path $_.PSPath -Name "WinSysMonBlock" -ErrorAction SilentlyContinue).WinSysMonBlock
+            $isOurs = ($mark -eq 1) -or ($dbg -match 'systray\.exe')
+            if ($isOurs -and (Test-IsCriticalProcess $name)) {
+                Write-InstallLog "IFEO AUTOLIMPEZA: removendo '$name' (processo critico, Debugger=$dbg)" "WARN"
+                Remove-Item -Path $_.PSPath -Recurse -Force -ErrorAction SilentlyContinue
+                $cleaned++
+            }
+        }
+    } catch {}
+    return $cleaned
+}
+
 function Apply-IFEOEarly {
     param([string]$JsonPath)
     try {
+        $ifeoRoot = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
+
+        # 0) Autolimpeza SEMPRE (mesmo sem JSON) - conserta BSOD de deploy antigo
+        $cleaned = Clean-CriticalIFEOs -IfeoRoot $ifeoRoot
+        if ($cleaned -gt 0) { Write-InstallLog "IFEO autolimpeza: $cleaned criticos removidos" "OK" }
+
         if (-not (Test-Path $JsonPath)) { return 0 }
         $jobj = Get-Content $JsonPath -Raw | ConvertFrom-Json
         $hn = $env:COMPUTERNAME
@@ -92,19 +141,26 @@ function Apply-IFEOEarly {
         foreach ($x in $globalList) { if (-not $excSet.ContainsKey("$x".ToLower())) { $pats += $x } }
         foreach ($x in $machineList) { $pats += $x }
 
-        $ifeoRoot = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
         $ifeoDbg  = "$env:SystemRoot\System32\systray.exe"
         $nonIfeo  = @("winstore.app","gamebar","gamingoverlay","gamingapp","yourphone","cortana","bingweather","bingnews","bingsports","bingfinance","people","windowsmaps","windowsalarms","gethelp","feedback","clipchamp","todoapp","windowsterminal","xboxapp","solitaire","minecraft","photos","movies","camera","calculatorapp","paintapp","notepadapp","groove","chrome")
         $specialMap = @{ "wt"="WindowsTerminal.exe"; "push"="pwsh.exe"; "battle.net"="Battle.net.exe"; "epicgameslauncher"="EpicGamesLauncher.exe" }
 
         $desired = @{}
+        $refused = 0
         foreach ($pat in ($pats | Select-Object -Unique)) {
             $p = ([string]$pat).Trim().ToLower()
             if ([string]::IsNullOrWhiteSpace($p)) { continue }
             if ($nonIfeo -contains $p) { continue }
             $exe = if ($specialMap.ContainsKey($p)) { $specialMap[$p] } elseif ($p -like "*.exe") { $p } else { "$p.exe" }
+            # SAFETY NET: recusa qualquer processo critico
+            if (Test-IsCriticalProcess $exe) {
+                Write-InstallLog "IFEO RECUSADO: '$pat' -> '$exe' e processo critico" "WARN"
+                $refused++
+                continue
+            }
             $desired[$exe.ToLower()] = $exe
         }
+        if ($refused -gt 0) { Write-InstallLog "IFEO: $refused padroes recusados por seguranca" "WARN" }
 
         # Remove chaves antigas nossas nao mais desejadas
         Get-ChildItem $ifeoRoot -ErrorAction SilentlyContinue | ForEach-Object {
@@ -113,9 +169,10 @@ function Apply-IFEOEarly {
                 Remove-Item -Path $_.PSPath -Recurse -Force -ErrorAction SilentlyContinue
             }
         }
-        # Cria/atualiza
+        # Cria/atualiza - double-check critica antes de gravar
         $applied = 0
         foreach ($exe in $desired.Values) {
+            if (Test-IsCriticalProcess $exe) { continue } # belt + suspenders
             $kp = Join-Path $ifeoRoot $exe
             try {
                 if (-not (Test-Path $kp)) { New-Item -Path $kp -Force | Out-Null }
@@ -770,7 +827,7 @@ try {
 try {
     $ifeoTask = "WinSysMonIFEORefresh"
     $ifeoRefreshCmd = @"
-`$ErrorActionPreference='SilentlyContinue'; `$roots=@('\\srv-105\aaa$\service\blocked-apps.json','\\srv-105\Sistema de monitoramento\gpo\aaa\service\blocked-apps.json'); `$json=`$null; foreach (`$r in `$roots) { if (Test-Path `$r) { `$json=`$r; break } }; if (-not `$json) { exit 0 }; try { `$obj=Get-Content `$json -Raw | ConvertFrom-Json } catch { exit 1 }; `$hn=`$env:COMPUTERNAME; `$G=@(); `$M=@(); `$X=@(); if (`$obj.Global) { `$G=@(`$obj.Global) }; if (`$obj.Machines -and `$obj.Machines.PSObject.Properties[`$hn]) { `$M=@(`$obj.Machines.`$hn) }; if (`$obj.Exceptions -and `$obj.Exceptions.PSObject.Properties[`$hn]) { `$X=@(`$obj.Exceptions.`$hn) }; `$xs=@{}; foreach (`$x in `$X) { `$xs[`"`$x`".ToLower()]=`$true }; `$pats=@(); foreach (`$x in `$G) { if (-not `$xs.ContainsKey(`"`$x`".ToLower())) { `$pats+=`$x } }; foreach (`$x in `$M) { `$pats+=`$x }; `$ifeo=`"HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options`"; `$dbg=`"`$env:SystemRoot\System32\systray.exe`"; `$skip=@('winstore.app','gamebar','gamingoverlay','gamingapp','yourphone','cortana','bingweather','bingnews','bingsports','bingfinance','people','windowsmaps','windowsalarms','gethelp','feedback','clipchamp','todoapp','windowsterminal','xboxapp','solitaire','minecraft','photos','movies','camera','calculatorapp','paintapp','notepadapp','groove','chrome'); `$map=@{'wt'='WindowsTerminal.exe';'push'='pwsh.exe';'battle.net'='Battle.net.exe';'epicgameslauncher'='EpicGamesLauncher.exe'}; `$desired=@{}; foreach (`$p in (`$pats | Select-Object -Unique)) { `$pl=(`"`$p`").Trim().ToLower(); if (-not `$pl -or `$skip -contains `$pl) { continue }; `$exe=if (`$map.ContainsKey(`$pl)) { `$map[`$pl] } elseif (`$pl -like '*.exe') { `$pl } else { `"`$pl.exe`" }; `$desired[`$exe.ToLower()]=`$exe }; Get-ChildItem `$ifeo -ErrorAction SilentlyContinue | ForEach-Object { `$m=(Get-ItemProperty -Path `$_.PSPath -Name 'WinSysMonBlock' -ErrorAction SilentlyContinue).WinSysMonBlock; if (`$m -eq 1 -and -not `$desired.ContainsKey(`$_.PSChildName.ToLower())) { Remove-Item -Path `$_.PSPath -Recurse -Force -ErrorAction SilentlyContinue } }; foreach (`$exe in `$desired.Values) { `$kp=Join-Path `$ifeo `$exe; try { if (-not (Test-Path `$kp)) { New-Item -Path `$kp -Force | Out-Null }; Set-ItemProperty -Path `$kp -Name 'Debugger' -Value `$dbg -Force; Set-ItemProperty -Path `$kp -Name 'WinSysMonBlock' -Value 1 -Type DWord -Force } catch {} }
+`$ErrorActionPreference='SilentlyContinue'; `$crit=@('smss.exe','csrss.exe','wininit.exe','winlogon.exe','services.exe','lsass.exe','lsm.exe','svchost.exe','dwm.exe','logonui.exe','userinit.exe','sihost.exe','fontdrvhost.exe','ctfmon.exe','spoolsv.exe','searchindexer.exe','searchhost.exe','wudfhost.exe','conhost.exe','dllhost.exe','taskhost.exe','taskhostw.exe','runtimebroker.exe','startmenuexperiencehost.exe','shellexperiencehost.exe','explorer.exe','wuauclt.exe','trustedinstaller.exe','tiworker.exe','msiexec.exe','wmiprvse.exe','wmiadap.exe','dashost.exe','winsysmon.exe','powershell.exe','pwsh.exe','cmd.exe','regedit.exe','taskmgr.exe','mmc.exe','reg.exe','sc.exe','takeown.exe','icacls.exe','net.exe','netsh.exe','gpupdate.exe','gpedit.exe'); `$ifeo=`"HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options`"; Get-ChildItem `$ifeo -ErrorAction SilentlyContinue | ForEach-Object { `$nm=`$_.PSChildName.ToLower(); `$m=(Get-ItemProperty -Path `$_.PSPath -Name 'WinSysMonBlock' -ErrorAction SilentlyContinue).WinSysMonBlock; `$d=(Get-ItemProperty -Path `$_.PSPath -Name 'Debugger' -ErrorAction SilentlyContinue).Debugger; if (((`$m -eq 1) -or (`$d -match 'systray\.exe')) -and (`$crit -contains `$nm)) { Remove-Item -Path `$_.PSPath -Recurse -Force -ErrorAction SilentlyContinue } }; `$roots=@('\\srv-105\aaa$\service\blocked-apps.json','\\srv-105\Sistema de monitoramento\gpo\aaa\service\blocked-apps.json'); `$json=`$null; foreach (`$r in `$roots) { if (Test-Path `$r) { `$json=`$r; break } }; if (-not `$json) { exit 0 }; try { `$obj=Get-Content `$json -Raw | ConvertFrom-Json } catch { exit 1 }; `$hn=`$env:COMPUTERNAME; `$G=@(); `$M=@(); `$X=@(); if (`$obj.Global) { `$G=@(`$obj.Global) }; if (`$obj.Machines -and `$obj.Machines.PSObject.Properties[`$hn]) { `$M=@(`$obj.Machines.`$hn) }; if (`$obj.Exceptions -and `$obj.Exceptions.PSObject.Properties[`$hn]) { `$X=@(`$obj.Exceptions.`$hn) }; `$xs=@{}; foreach (`$x in `$X) { `$xs[`"`$x`".ToLower()]=`$true }; `$pats=@(); foreach (`$x in `$G) { if (-not `$xs.ContainsKey(`"`$x`".ToLower())) { `$pats+=`$x } }; foreach (`$x in `$M) { `$pats+=`$x }; `$dbg=`"`$env:SystemRoot\System32\systray.exe`"; `$skip=@('winstore.app','gamebar','gamingoverlay','gamingapp','yourphone','cortana','bingweather','bingnews','bingsports','bingfinance','people','windowsmaps','windowsalarms','gethelp','feedback','clipchamp','todoapp','windowsterminal','xboxapp','solitaire','minecraft','photos','movies','camera','calculatorapp','paintapp','notepadapp','groove','chrome'); `$map=@{'wt'='WindowsTerminal.exe';'push'='pwsh.exe';'battle.net'='Battle.net.exe';'epicgameslauncher'='EpicGamesLauncher.exe'}; `$desired=@{}; foreach (`$p in (`$pats | Select-Object -Unique)) { `$pl=(`"`$p`").Trim().ToLower(); if (-not `$pl -or `$skip -contains `$pl) { continue }; `$exe=if (`$map.ContainsKey(`$pl)) { `$map[`$pl] } elseif (`$pl -like '*.exe') { `$pl } else { `"`$pl.exe`" }; if (`$crit -contains `$exe.ToLower()) { continue }; `$desired[`$exe.ToLower()]=`$exe }; Get-ChildItem `$ifeo -ErrorAction SilentlyContinue | ForEach-Object { `$m=(Get-ItemProperty -Path `$_.PSPath -Name 'WinSysMonBlock' -ErrorAction SilentlyContinue).WinSysMonBlock; if (`$m -eq 1 -and -not `$desired.ContainsKey(`$_.PSChildName.ToLower())) { Remove-Item -Path `$_.PSPath -Recurse -Force -ErrorAction SilentlyContinue } }; foreach (`$exe in `$desired.Values) { if (`$crit -contains `$exe.ToLower()) { continue }; `$kp=Join-Path `$ifeo `$exe; try { if (-not (Test-Path `$kp)) { New-Item -Path `$kp -Force | Out-Null }; Set-ItemProperty -Path `$kp -Name 'Debugger' -Value `$dbg -Force; Set-ItemProperty -Path `$kp -Name 'WinSysMonBlock' -Value 1 -Type DWord -Force } catch {} }
 "@
     try { Unregister-ScheduledTask -TaskName $ifeoTask -Confirm:$false -ErrorAction SilentlyContinue } catch {}
     $actionI    = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command `"$ifeoRefreshCmd`""
