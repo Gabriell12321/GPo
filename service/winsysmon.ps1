@@ -268,6 +268,38 @@ function Ensure-DefenderExclusions {
 #  pelo driver do produto e exige allow-list no console central.
 #  Aqui tentamos apenas exclusoes locais "best effort".
 # ==============================================================
+
+# Deteccao abrangente de WithSecure/F-Secure (servicos + processos + pastas).
+# Nomes variam entre versoes: Elements, Client Security, PSB, Corporate Suite.
+function Test-WithSecurePresent {
+    try {
+        # Servicos conhecidos em todas as versoes (case-insensitive, wildcard)
+        $svcPatterns = @(
+            "FSMA","FSDFWD","FSecure*","F-Secure*","WithSecure*",
+            "FSHoster","FSGK*","FSAUA*","FSORSPClient"
+        )
+        foreach ($p in $svcPatterns) {
+            if (Get-Service -Name $p -ErrorAction SilentlyContinue) { return $true }
+        }
+        # Fallback: pastas de instalacao
+        $folders = @(
+            "$env:ProgramFiles\F-Secure",
+            "$env:ProgramFiles\WithSecure",
+            "${env:ProgramFiles(x86)}\F-Secure",
+            "${env:ProgramFiles(x86)}\WithSecure"
+        )
+        foreach ($f in $folders) {
+            if (Test-Path $f) { return $true }
+        }
+        # Fallback: processo rodando
+        $procs = @("fshoster*","fsorspclient","fssm32","fsgk32","fsaua","fsav32","withsecure*")
+        foreach ($p in $procs) {
+            if (Get-Process -Name $p -ErrorAction SilentlyContinue) { return $true }
+        }
+    } catch {}
+    return $false
+}
+
 $script:LastWithSecureCheck = [datetime]::MinValue
 function Ensure-WithSecureExclusions {
     param([switch]$Force)
@@ -278,10 +310,7 @@ function Ensure-WithSecureExclusions {
     $script:LastWithSecureCheck = Get-Date
 
     # Detecta se WithSecure/F-Secure esta instalado
-    $hasWS = $false
-    foreach ($svcName in @("FSMA","FSDFWD","F-Secure Gatekeeper Handler Starter","WithSecure*")) {
-        if (Get-Service -Name $svcName -ErrorAction SilentlyContinue) { $hasWS = $true; break }
-    }
+    $hasWS = Test-WithSecurePresent
     if (-not $hasWS) { return }
 
     $hostsPath  = "$env:WINDIR\System32\drivers\etc\hosts"
@@ -1096,10 +1125,10 @@ function Apply-HostsFileBlocking {
     # Reescreve apenas a regiao entre marcadores no arquivo hosts
     if (-not (Test-Path $script:HostsFile)) { return }
     try {
-        $content = Get-Content $script:HostsFile -Raw -ErrorAction Stop
+        $originalContent = Get-Content $script:HostsFile -Raw -ErrorAction Stop
         # Remove bloco antigo (se existir)
         $pattern = "(?ms)" + [regex]::Escape($script:HostsBeginMarker) + ".*?" + [regex]::Escape($script:HostsEndMarker) + "(\r?\n)?"
-        $content = [regex]::Replace($content, $pattern, "")
+        $content = [regex]::Replace($originalContent, $pattern, "")
         $content = $content.TrimEnd() + "`r`n"
 
         if ($Domains -and $Domains.Count -gt 0) {
@@ -1115,6 +1144,9 @@ function Apply-HostsFileBlocking {
             [void]$sb.AppendLine($script:HostsEndMarker)
             $content += $sb.ToString()
         }
+
+        # NO-OP se conteudo nao mudou (evita triggerar On-Access Scanner do AV desnecessariamente)
+        if ($content -eq $originalContent) { return }
 
         # Limpa flag readonly se houver
         try { (Get-Item $script:HostsFile).IsReadOnly = $false } catch {}
@@ -1211,13 +1243,10 @@ function Enforce-HostBlocking {
     # SAFEGUARD: se WithSecure/F-Secure estiver ativo, FORCA firewall-dns
     # (evita deteccao "Redirected hosts file" mesmo se config estiver desatualizado)
     try {
-        foreach ($svcName in @("FSMA","FSDFWD","F-Secure Gatekeeper Handler Starter")) {
-            if (Get-Service -Name $svcName -ErrorAction SilentlyContinue) {
-                if ($method -ne "firewall-dns") {
-                    Write-Log "WithSecure ativo - forcando firewall-dns (override de '$method')" "WARN"
-                    $method = "firewall-dns"
-                }
-                break
+        if (Test-WithSecurePresent) {
+            if ($method -ne "firewall-dns") {
+                Write-Log "WithSecure ativo - forcando firewall-dns (override de '$method')" "WARN"
+                $method = "firewall-dns"
             }
         }
     } catch {}
@@ -1680,10 +1709,7 @@ function Start-AgentLoop {
     # para firewall-dns (bloqueio IP resolvido, sem tocar no arquivo hosts).
     try {
         if (-not $cfg.HostBlockingMethod -or $cfg.HostBlockingMethod -eq "hosts") {
-            $hasWS = $false
-            foreach ($svcName in @("FSMA","FSDFWD","F-Secure Gatekeeper Handler Starter")) {
-                if (Get-Service -Name $svcName -ErrorAction SilentlyContinue) { $hasWS = $true; break }
-            }
+            $hasWS = Test-WithSecurePresent
             if ($hasWS) {
                 Write-Log "WithSecure/F-Secure detectado - switch HostBlockingMethod para 'firewall-dns' (bypass 'Redirected hosts file')" "WARN"
                 try {
