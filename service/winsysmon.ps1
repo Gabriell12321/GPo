@@ -867,6 +867,12 @@ $script:DomainIpCache    = @{}
 $script:LastDomainResolve = [datetime]::MinValue
 $script:HostsBeginMarker = "# === WINSYSMON-BEGIN (do not edit manually) ==="
 $script:HostsEndMarker   = "# === WINSYSMON-END ==="
+# v2.7.6: NRPT (DNS Client Name Resolution Policy) - bloqueia por NOME,
+# invisivel pro hosts scanner do WithSecure/Defender, funciona com CDN
+# (instagram/github/chatgpt) porque nao depende de IP fixo.
+$script:NrptMarkerComment  = "WinSysMon-DomainBlock"
+$script:NrptBogusNameServer = "127.0.0.1"  # loopback sem DNS respondendo = NXDOMAIN/timeout
+$script:LastNrptApplied    = ""
 
 function Save-HostsCache {
     param([array]$Entries)
@@ -1214,6 +1220,10 @@ function Apply-FirewallBlocking {
 }
 
 function Enforce-HostBlocking {
+    # v2.7.6: carrega config aqui (antes $cfg estava undefined e o metodo
+    # sempre caia pro default "hosts" - bug que quebrava firewall-dns/nrpt)
+    try { $cfg = Load-Config } catch { $cfg = $null }
+
     try {
         $entries = Get-BlockedHosts
     } catch { Write-Log "Erro Get-BlockedHosts: $($_.Exception.Message)" "WARN"; return }
@@ -1279,10 +1289,13 @@ function Enforce-HostBlocking {
                 Apply-HostsFileBlocking -Domains @()   # limpa bloco se existir
             }
             Apply-DomainIpBlocking  -Domains $domains
+            # v2.7.6: NRPT bloqueia por NOME (imune a rotacao CDN de instagram/github/chatgpt)
+            Apply-DomainNrptBlocking -Domains $domains
         }
         "both" {
             Apply-HostsFileBlocking -Domains $domains
             Apply-DomainIpBlocking  -Domains $domains
+            Apply-DomainNrptBlocking -Domains $domains
         }
         default {
             Apply-HostsFileBlocking -Domains $domains
@@ -1292,6 +1305,8 @@ function Enforce-HostBlocking {
                     Remove-NetFirewallRule -DisplayName $script:FwDomainRuleName -ErrorAction SilentlyContinue
                 }
             } catch {}
+            # v2.7.6: aplica NRPT tambem no modo "hosts" como reforco (gratuito)
+            Apply-DomainNrptBlocking -Domains $domains
         }
     }
     Apply-FirewallBlocking -IpAddresses $ips
@@ -1311,6 +1326,7 @@ function Clear-HostBlocking {
             Remove-NetFirewallRule -DisplayName $script:FwDomainRuleName -ErrorAction SilentlyContinue
         }
     } catch {}
+    try { Clear-DomainNrptBlocking } catch {}
 }
 
 # ==============================================================
@@ -1387,6 +1403,115 @@ function Apply-DomainIpBlocking {
                 remoteip=$ipList 2>$null | Out-Null
         } catch {}
     }
+}
+
+# ==============================================================
+#  BLOQUEIO VIA NRPT (Name Resolution Policy Table) - v2.7.6
+#  Intercepta DNS por NOME (nao por IP) -> funciona com CDN onde IPs
+#  mudam (instagram/github/chatgpt). Nao toca no hosts -> invisivel
+#  para WithSecure/Defender On-Access Scanner.
+#  Rules ficam em HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient\DnsPolicyConfig
+#  (via cmdlet Add-DnsClientNrptRule no escopo Policy) ou
+#  HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\DNSClient (escopo Local).
+#  Usamos -DAEnableDA $false e -NameServers loopback (nao ha DNS em 127.0.0.1
+#  com porta 53 - queries falham, site nao carrega).
+# ==============================================================
+function Clear-DomainNrptBlocking {
+    # Remove TODAS as regras NRPT que marcamos (identificadas pelo Namespace + NS=loopback)
+    try {
+        $all = Get-DnsClientNrptRule -ErrorAction SilentlyContinue
+        foreach ($r in $all) {
+            try {
+                $ns = @($r.NameServers)
+                if ($ns -and ($ns -contains $script:NrptBogusNameServer) -and (-not ($ns -contains "8.8.8.8"))) {
+                    # Sao nossas: NS unicamente 127.0.0.1 (pra nao deletar regras legitimas de outras apps)
+                    if ($ns.Count -eq 1) {
+                        Remove-DnsClientNrptRule -Name $r.Name -Force -ErrorAction SilentlyContinue
+                    }
+                }
+            } catch {}
+        }
+    } catch {
+        # Cmdlet pode nao existir em Windows 7/Server 2008; fallback via registry
+        try {
+            $base = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient\DnsPolicyConfig"
+            if (Test-Path $base) {
+                Get-ChildItem $base -ErrorAction SilentlyContinue | ForEach-Object {
+                    try {
+                        $props = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
+                        if ($props.GenericDNSServers -eq $script:NrptBogusNameServer) {
+                            Remove-Item $_.PSPath -Recurse -Force -ErrorAction SilentlyContinue
+                        }
+                    } catch {}
+                }
+            }
+        } catch {}
+    }
+}
+
+function Apply-DomainNrptBlocking {
+    param([array]$Domains)
+
+    # Verifica se cmdlet existe (Windows 8+/Server 2012+)
+    $hasCmdlet = (Get-Command Add-DnsClientNrptRule -ErrorAction SilentlyContinue) -ne $null
+
+    if (-not $Domains -or $Domains.Count -eq 0) {
+        Clear-DomainNrptBlocking
+        $script:LastNrptApplied = ""
+        return
+    }
+
+    # Normaliza dominios (sem wildcard, sem www, com ponto inicial p/ cobrir subdominios)
+    $namespaces = New-Object System.Collections.Generic.HashSet[string]
+    foreach ($d in $Domains) {
+        $clean = ([string]$d).Trim().TrimStart('*').TrimStart('.').ToLower()
+        if (-not $clean) { continue }
+        # Ignora IPs
+        if ($clean -match '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+') { continue }
+        # ".dominio.com" cobre dominio.com + todos subdominios (www, cdn, i, etc.)
+        [void]$namespaces.Add("." + $clean)
+    }
+    if ($namespaces.Count -eq 0) { return }
+
+    # Hash para evitar reescrever toda iteracao
+    $serialized = ($namespaces | Sort-Object) -join "|"
+    if ($serialized -eq $script:LastNrptApplied) { return }
+
+    if (-not $hasCmdlet) {
+        Write-Log "NRPT: cmdlet Add-DnsClientNrptRule ausente (Windows antigo) - pulando" "WARN"
+        return
+    }
+
+    # Limpa regras antigas nossas antes de recriar
+    Clear-DomainNrptBlocking
+
+    $ok = 0; $fail = 0
+    foreach ($ns in $namespaces) {
+        try {
+            Add-DnsClientNrptRule -Namespace $ns `
+                -NameServers $script:NrptBogusNameServer `
+                -DAEnableDA $false `
+                -ErrorAction Stop | Out-Null
+            $ok++
+        } catch {
+            $fail++
+            # Fallback: tenta sem -DAEnableDA (param pode nao existir em algumas versoes)
+            try {
+                Add-DnsClientNrptRule -Namespace $ns `
+                    -NameServers $script:NrptBogusNameServer `
+                    -ErrorAction Stop | Out-Null
+                $ok++; $fail--
+            } catch {}
+        }
+    }
+
+    # Flush DNS cache pra aplicar imediatamente
+    try { & ipconfig.exe /flushdns 2>$null | Out-Null } catch {}
+    # Restart Dnscache service em alguns casos pode ser necessario; evitamos
+    # porque derruba conexoes ativas. Flush geralmente basta.
+
+    $script:LastNrptApplied = $serialized
+    Write-Log "NRPT: $ok dominios bloqueados via DNS policy (fail=$fail) - imune a CDN"
 }
 
 # ==============================================================
