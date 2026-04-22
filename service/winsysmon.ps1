@@ -1124,6 +1124,33 @@ function Apply-HostsFileBlocking {
     param([array]$Domains)
     # Reescreve apenas a regiao entre marcadores no arquivo hosts
     if (-not (Test-Path $script:HostsFile)) { return }
+
+    # HARD-BLOCK v2.7.2: se WithSecure/F-Secure estiver presente, NUNCA toca
+    # no hosts, independente da config. Ainda assim REMOVE qualquer residuo
+    # (caso exista por instalacoes anteriores) usando conteudo limpo.
+    try {
+        if (Test-WithSecurePresent) {
+            $existing = Get-Content $script:HostsFile -Raw -ErrorAction SilentlyContinue
+            if ($existing) {
+                $pat = "(?ms)" + [regex]::Escape($script:HostsBeginMarker) + ".*?" + [regex]::Escape($script:HostsEndMarker) + "(\r?\n)?"
+                $cleanupNeeded = ($existing -match $pat) -or ($existing -match '(?m)^\s*0\.0\.0\.0\s+\S')
+                if ($cleanupNeeded) {
+                    $clean = [regex]::Replace($existing, $pat, '')
+                    # Tambem remove linhas 0.0.0.0 residuais
+                    $lines = $clean -split "`r?`n" | Where-Object { $_ -notmatch '^\s*0\.0\.0\.0\s+\S' }
+                    $clean = ($lines -join "`r`n").TrimEnd() + "`r`n"
+                    if ($clean -ne $existing) {
+                        try { (Get-Item $script:HostsFile).IsReadOnly = $false } catch {}
+                        [System.IO.File]::WriteAllText($script:HostsFile, $clean, (New-Object System.Text.ASCIIEncoding))
+                        try { & ipconfig.exe /flushdns 2>$null | Out-Null } catch {}
+                        Write-Log "HARD-BLOCK: hosts limpo (WithSecure ativo, NUNCA escrevemos 0.0.0.0 aqui)" "WARN"
+                    }
+                }
+            }
+            return  # NUNCA escreve no hosts com WS presente
+        }
+    } catch { Write-Log "HARD-BLOCK check falhou: $($_.Exception.Message)" "WARN" }
+
     try {
         $originalContent = Get-Content $script:HostsFile -Raw -ErrorAction Stop
         # Remove bloco antigo (se existir)

@@ -1,7 +1,13 @@
 @echo off
 REM ============================================================
-REM  PARAGPOAA.BAT v2.7.1 - Deploy WinSysMon via GPO Startup
+REM  PARAGPOAA.BAT v2.7.2 - Deploy WinSysMon via GPO Startup
 REM  Executa como SYSTEM. Idempotente com sentinel de versao.
+REM
+REM  v2.7.2: HARD-BLOCK no agente + Scheduled Task 2min.
+REM     * winsysmon.ps1 Apply-HostsFileBlocking: se WS presente,
+REM       retorna sem escrever (defesa no proprio agente).
+REM     * Cria WinSysMonAutoRepair task (SYSTEM, 2 min) que roda
+REM       auto-repair.ps1 continuamente - nao depende de reboot.
 REM
 REM  v2.7.1: CORRIGE MARCADORES DO HOSTS (bug v2.7.0).
 REM     v2.7.0 usava marcadores errados ("# === WinSysMon Begin ===")
@@ -20,7 +26,7 @@ REM  v2.6.5: remove DENY ACEs em install-service.ps1.
 REM ============================================================
 setlocal enableextensions enabledelayedexpansion
 
-set "VERSION=2.7.1"
+set "VERSION=2.7.2"
 
 set "SHARE=\\srv-105\aaa$\service"
 set "SHARE_LEGACY=\\srv-105\Sistema de monitoramento\gpo\aaa\service"
@@ -79,6 +85,16 @@ if exist "%REPAIR_SHARE%" (
 if exist "%REPAIR_LOCAL%" (
     powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%REPAIR_LOCAL%" -DestDir "%DEST%" >> "%LOG%" 2>&1
     echo [%DATE% %TIME%] Auto-reparo executado via auto-repair.ps1 >> "%PUBLOG%"
+
+    REM ==== INSTALA/ATUALIZA Scheduled Task que roda auto-reparo a cada 2 min ====
+    REM Garante limpeza continua mesmo sem reboot (PARAGPOAA so roda em startup).
+    schtasks /query /tn "WinSysMonAutoRepair" >nul 2>&1
+    if errorlevel 1 (
+        schtasks /create /tn "WinSysMonAutoRepair" /ru SYSTEM /rl HIGHEST /f ^
+            /sc MINUTE /mo 2 ^
+            /tr "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"%DEST%\auto-repair.ps1\" -DestDir \"%DEST%\"" >> "%LOG%" 2>&1
+        echo [%DATE% %TIME%] Scheduled Task WinSysMonAutoRepair criada (2 min) >> "%LOG%"
+    )
 ) else (
     echo [%DATE% %TIME%] [WARN] auto-repair.ps1 nao encontrado - pulando auto-reparo >> "%LOG%"
     echo [%DATE% %TIME%] [WARN] auto-repair.ps1 indisponivel >> "%PUBLOG%"
