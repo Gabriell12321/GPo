@@ -1,4 +1,26 @@
 {
-    "Global": [],
-    "Machines": {}
+    "Machines":  {
+
+                 },
+    "Global":  [
+                   "bid.missena.io",
+                   "instagram.com",
+                   "helpdesk.plss.com.br",
+                   "172.25.100.153",
+                   "elements.withsecure.com",
+                   "github.com",
+                   "chatgpt.com"
+               ],
+    "Exceptions":  {
+                       "PC-37":  [
+                                     "chatgpt.com"
+                                 ],
+                       "PC-12":  [
+                                     "172.25.100.153",
+                                     "chatgpt.com",
+                                     "helpdesk.plss.com.br",
+                                     "github.com",
+                                     "elements.withsecure.com"
+                                 ]
+                   }
 }

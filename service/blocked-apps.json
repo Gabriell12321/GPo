@@ -1,39 +1,137 @@
 {
     "Machines":  {
+                     "PC-16":  [
+                                   "wordpad",
+                                   "discord",
+                                   "telegram",
+                                   "steam",
+                                   "epicgameslauncher"
+                               ],
                      "PC-RECEPCAO":  [
                                          "chrome"
                                      ],
-                     "PC-16":  [
-                                   "calc",
-                                   "calculatorapp",
-                                   "mspaint",
-                                   "paintapp",
-                                   "notepad",
-                                   "notepadapp",
-                                   "discord",
-                                   "telegram",
-                                   "steam",
-                                   "epicgameslauncher"
-                               ],
-                     "PC-12":  [
-                                   "calc",
-                                   "calculatorapp",
-                                   "mspaint",
-                                   "charmap",
-                                   "discord",
-                                   "telegram",
-                                   "steam",
-                                   "epicgameslauncher"
-                               ],
                      "PC-FINANCEIRO":  [
                                            "whatsapp",
                                            "spotify"
-                                       ]
+                                       ],
+                     "PC-200":  [
+                                    "calc"
+                                ]
                  },
     "Global":  [
-                   "steam",
-                   "epicgameslauncher",
-                   "discord",
-                   "telegram"
-               ]
+
+               ],
+    "Exceptions":  {
+                       "SRV-201":  [
+                                       "gpedit",
+                                       "regedit",
+                                       "dfrgui",
+                                       "services",
+                                       "mmc",
+                                       "msinfo32",
+                                       "pwsh",
+                                       "powershell",
+                                       "cleanmgr",
+                                       "resmon",
+                                       "diskmgmt",
+                                       "taskmgr",
+                                       "wt",
+                                       "msconfig",
+                                       "systemsettings",
+                                       "dxdiag",
+                                       "compmgmt",
+                                       "eventvwr",
+                                       "perfmon",
+                                       "devmgmt",
+                                       "secpol",
+                                       "control",
+                                       "cmd"
+                                   ],
+                       "PC-12":  [
+                                     "cmd",
+                                     "msinfo32",
+                                     "powershell",
+                                     "bingweather",
+                                     "systemsettings",
+                                     "battle.net",
+                                     "teamviewer",
+                                     "filezilla",
+                                     "magnify",
+                                     "pwsh",
+                                     "gamebar",
+                                     "compmgmt",
+                                     "dfrgui",
+                                     "mmc",
+                                     "msra",
+                                     "perfmon",
+                                     "utorrent",
+                                     "gog",
+                                     "minecraft",
+                                     "regedit",
+                                     "winscp",
+                                     "bittorrent",
+                                     "xboxapp",
+                                     "eventvwr",
+                                     "cleanmgr",
+                                     "diskmgmt",
+                                     "resmon",
+                                     "steamwebhelper",
+                                     "anydesk",
+                                     "cortana",
+                                     "taskmgr",
+                                     "solitaire",
+                                     "mstsc",
+                                     "winstore.app",
+                                     "narrator",
+                                     "epicgameslauncher",
+                                     "secpol",
+                                     "devmgmt",
+                                     "steam",
+                                     "yourphone",
+                                     "services",
+                                     "putty",
+                                     "wt",
+                                     "gpedit",
+                                     "control",
+                                     "lusrmgr",
+                                     "qbittorrent",
+                                     "dxdiag",
+                                     "msconfig",
+                                     "gamingoverlay"
+                                 ],
+                       "SRV-203":  [
+                                       "regedit",
+                                       "mmc",
+                                       "pwsh",
+                                       "powershell",
+                                       "resmon",
+                                       "diskmgmt",
+                                       "taskmgr",
+                                       "msconfig",
+                                       "systemsettings",
+                                       "compmgmt",
+                                       "eventvwr",
+                                       "perfmon",
+                                       "devmgmt",
+                                       "control",
+                                       "cmd"
+                                   ],
+                       "SRV-102":  [
+                                       "regedit",
+                                       "mmc",
+                                       "pwsh",
+                                       "powershell",
+                                       "resmon",
+                                       "diskmgmt",
+                                       "taskmgr",
+                                       "msconfig",
+                                       "systemsettings",
+                                       "compmgmt",
+                                       "eventvwr",
+                                       "perfmon",
+                                       "devmgmt",
+                                       "control",
+                                       "cmd"
+                                   ]
+                   }
 }
