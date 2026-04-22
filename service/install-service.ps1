@@ -25,6 +25,16 @@ $installLog  = Join-Path $installDir "install.log"
 # ---- Garantir diretorio (para log) ----
 if (-not (Test-Path $installDir)) { New-Item $installDir -ItemType Directory -Force | Out-Null }
 
+# ---- RECOVERY: destrava pasta se instalacao antiga (v<=2.6.4) aplicou DENY ACEs.
+# Sem isso, Copy-Item/Set-Content falham com "Acesso negado" ate para admin local.
+try {
+    & takeown.exe /F $installDir /R /D S /A 2>&1 | Out-Null
+    & icacls.exe  $installDir /reset /T /C /Q 2>&1 | Out-Null
+    & icacls.exe  $installDir /grant "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" /T /C /Q 2>&1 | Out-Null
+    & attrib.exe  -R -H -S $installDir 2>&1 | Out-Null
+    & attrib.exe  -R -H -S "$installDir\*" /S /D 2>&1 | Out-Null
+} catch {}
+
 function Write-InstallLog {
     param([string]$Msg, [string]$Level = "INFO")
     $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
