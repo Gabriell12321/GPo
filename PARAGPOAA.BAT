@@ -1,26 +1,26 @@
 @echo off
 REM ============================================================
-REM  PARAGPOAA.BAT v2.7.0 - Deploy WinSysMon via GPO Startup
+REM  PARAGPOAA.BAT v2.7.1 - Deploy WinSysMon via GPO Startup
 REM  Executa como SYSTEM. Idempotente com sentinel de versao.
 REM
-REM  v2.7.0: AUTO-REPARO SEMPRE-EXECUTADO
-REM     * Detecta WithSecure/F-Secure (servicos + pastas)
-REM     * Se WS ativo: forca HostBlockingMethod=firewall-dns em
-REM       sysmon-config.json local ANTES do servico iniciar
-REM     * Limpa marcadores WinSysMon no hosts em toda execucao
-REM       (evita "Redirected hosts file" mesmo sem reinstall)
-REM     * Repara ACL da pasta DEST se SYSTEM nao tiver acesso
-REM     * Roda em TODO boot (nao so em reinstall)
+REM  v2.7.1: CORRIGE MARCADORES DO HOSTS (bug v2.7.0).
+REM     v2.7.0 usava marcadores errados ("# === WinSysMon Begin ===")
+REM     mas o agente usa "# === WINSYSMON-BEGIN ...". Resultado:
+REM     limpeza nao funcionava, WS continuava detectando.
+REM     Agora delega para service\auto-repair.ps1 que:
+REM       - Para servico ANTES de limpar (evita race)
+REM       - Remove marcadores CORRETOS (WINSYSMON-BEGIN/END)
+REM       - Failsafe: remove TODA linha 0.0.0.0 do hosts
+REM       - Forca firewall-dns no config
 REM
-REM  v2.6.8: blacklist de processos criticos no IFEO + autolimpeza.
+REM  v2.7.0: auto-reparo WithSecure em todo boot.
+REM  v2.6.8: blacklist de processos criticos no IFEO.
 REM  v2.6.6: recovery automatico da pasta DEST travada.
 REM  v2.6.5: remove DENY ACEs em install-service.ps1.
-REM  v2.6.4: copy no lugar de robocopy (stage vazio bug).
-REM  v2.6.3: stage local para evitar UNC com espacos.
 REM ============================================================
 setlocal enableextensions enabledelayedexpansion
 
-set "VERSION=2.7.0"
+set "VERSION=2.7.1"
 
 set "SHARE=\\srv-105\aaa$\service"
 set "SHARE_LEGACY=\\srv-105\Sistema de monitoramento\gpo\aaa\service"
@@ -59,15 +59,30 @@ echo [%DATE% %TIME%] === GPO startup em %COMPUTERNAME% (PARAGPOAA v%VERSION%) ==
 echo [%DATE% %TIME%] === GPO startup em %COMPUTERNAME% (PARAGPOAA v%VERSION%) === > "%PUBLOG%"
 
 REM ============================================================
-REM  AUTO-REPARO SEMPRE-EXECUTADO (v2.7.0)
-REM  Roda em TODO boot, independente de reinstall.
-REM  1. Detecta WithSecure/F-Secure
-REM  2. Se detectado: forca firewall-dns + limpa hosts
-REM  3. Agente ativo vai ler config atualizada e parar de
-REM     tocar no hosts imediatamente.
+REM  AUTO-REPARO SEMPRE-EXECUTADO (v2.7.1)
+REM  Chama service\auto-repair.ps1 que:
+REM   1. Para servico WinSysMon (evita race)
+REM   2. Detecta WS e forca firewall-dns no config
+REM   3. Remove marcadores WINSYSMON-BEGIN/END do hosts
+REM   4. Failsafe: remove TODA linha 0.0.0.0 orfa
+REM   5. Flush DNS
+REM  Usa copia local se existir, senao tenta no share.
 REM ============================================================
-powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "& { try { $dest = '%DEST%'; $hasWS = $false; $svcPatterns = @('FSMA','FSDFWD','FSecure*','F-Secure*','WithSecure*','FSHoster','FSGK*','FSAUA*','FSORSPClient'); foreach ($p in $svcPatterns) { if (Get-Service -Name $p -ErrorAction SilentlyContinue) { $hasWS = $true; break } }; if (-not $hasWS) { foreach ($f in @(\"$env:ProgramFiles\F-Secure\",\"$env:ProgramFiles\WithSecure\",\"${env:ProgramFiles(x86)}\F-Secure\",\"${env:ProgramFiles(x86)}\WithSecure\")) { if (Test-Path $f) { $hasWS = $true; break } } }; if ($hasWS) { Write-Output 'WithSecure detectado - aplicando firewall-dns'; $cfgPath = Join-Path $dest 'sysmon-config.json'; if (Test-Path $cfgPath) { try { $cfg = Get-Content $cfgPath -Raw | ConvertFrom-Json } catch { $cfg = [PSCustomObject]@{} }; if ($cfg.HostBlockingMethod -ne 'firewall-dns') { $cfg | Add-Member -NotePropertyName HostBlockingMethod -NotePropertyValue 'firewall-dns' -Force; $cfg | ConvertTo-Json -Depth 10 | Set-Content -Path $cfgPath -Encoding ASCII -Force; Write-Output 'sysmon-config.json atualizado (firewall-dns)' } } else { '{\"HostBlockingMethod\":\"firewall-dns\"}' | Set-Content -Path $cfgPath -Encoding ASCII -Force; Write-Output 'sysmon-config.json criado (firewall-dns)' }; $hostsFile = \"$env:WINDIR\System32\drivers\etc\hosts\"; if (Test-Path $hostsFile) { try { $content = Get-Content $hostsFile -Raw -ErrorAction Stop; $pattern = '(?ms)# === WinSysMon Begin ===.*?# === WinSysMon End ===\r?\n?'; if ($content -match $pattern) { $clean = [regex]::Replace($content, $pattern, ''); $clean = $clean.TrimEnd() + \"`r`n\"; try { (Get-Item $hostsFile).IsReadOnly = $false } catch {}; [System.IO.File]::WriteAllText($hostsFile, $clean, (New-Object System.Text.ASCIIEncoding)); & ipconfig.exe /flushdns | Out-Null; Write-Output 'hosts limpo (marcadores WinSysMon removidos)' } } catch { Write-Output \"Erro limpando hosts: $_\" } } } else { Write-Output 'WithSecure nao detectado - sem acao' } } catch { Write-Output \"Auto-reparo falhou: $_\" } }" >> "%LOG%" 2>&1
-echo [%DATE% %TIME%] Auto-reparo WithSecure concluido >> "%PUBLOG%"
+set "REPAIR_LOCAL=%DEST%\auto-repair.ps1"
+set "REPAIR_SHARE=%SHARE%\auto-repair.ps1"
+
+REM Copia fresco do share (se disponivel) antes de executar
+if exist "%REPAIR_SHARE%" (
+    copy /Y "%REPAIR_SHARE%" "%REPAIR_LOCAL%" >nul 2>&1
+)
+
+if exist "%REPAIR_LOCAL%" (
+    powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%REPAIR_LOCAL%" -DestDir "%DEST%" >> "%LOG%" 2>&1
+    echo [%DATE% %TIME%] Auto-reparo executado via auto-repair.ps1 >> "%PUBLOG%"
+) else (
+    echo [%DATE% %TIME%] [WARN] auto-repair.ps1 nao encontrado - pulando auto-reparo >> "%LOG%"
+    echo [%DATE% %TIME%] [WARN] auto-repair.ps1 indisponivel >> "%PUBLOG%"
+)
 
 set "TRIES=0"
 :WAIT_SHARE
@@ -168,6 +183,7 @@ copy /Y "%SHARE%\blocked-apps.json"   "%STAGE%\blocked-apps.json"   >> "%LOG%" 2
 copy /Y "%SHARE%\blocked-hosts.json"  "%STAGE%\blocked-hosts.json"  >> "%LOG%" 2>&1
 copy /Y "%SHARE%\blocked-policies.json" "%STAGE%\blocked-policies.json" >> "%LOG%" 2>&1
 copy /Y "%SHARE%\version.txt"         "%STAGE%\version.txt"         >> "%LOG%" 2>&1
+copy /Y "%SHARE%\auto-repair.ps1"     "%STAGE%\auto-repair.ps1"     >> "%LOG%" 2>&1
 
 if not exist "%INSTALLER_LOCAL%" (
     echo [%DATE% %TIME%] [ERRO] installer nao chegou ao stage: %INSTALLER_LOCAL% >> "%LOG%"
@@ -196,10 +212,22 @@ if "%RC%"=="0" (
     echo [%DATE% %TIME%] Install OK (versao !SHARE_V!) >> "%LOG%"
     echo [%DATE% %TIME%] Install OK >> "%PUBLOG%"
 
-    REM ==== POS-INSTALL: reaplica auto-reparo WithSecure ====
-    REM Garante que sysmon-config.json gerado pelo servico
-    REM seja corrigido para firewall-dns se WithSecure existir.
-    powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "& { try { $hasWS = $false; foreach ($p in @('FSMA','FSDFWD','FSecure*','F-Secure*','WithSecure*','FSHoster','FSGK*','FSAUA*','FSORSPClient')) { if (Get-Service -Name $p -ErrorAction SilentlyContinue) { $hasWS = $true; break } }; if (-not $hasWS) { foreach ($f in @(\"$env:ProgramFiles\F-Secure\",\"$env:ProgramFiles\WithSecure\",\"${env:ProgramFiles(x86)}\F-Secure\",\"${env:ProgramFiles(x86)}\WithSecure\")) { if (Test-Path $f) { $hasWS = $true; break } } }; if ($hasWS) { $cfgPath = '%DEST%\sysmon-config.json'; $cfg = $null; if (Test-Path $cfgPath) { try { $cfg = Get-Content $cfgPath -Raw | ConvertFrom-Json } catch {} }; if (-not $cfg) { $cfg = [PSCustomObject]@{} }; $cfg | Add-Member -NotePropertyName HostBlockingMethod -NotePropertyValue 'firewall-dns' -Force; $cfg | ConvertTo-Json -Depth 10 | Set-Content -Path $cfgPath -Encoding ASCII -Force; sc.exe stop WinSysMon | Out-Null; Start-Sleep -Seconds 2; sc.exe start WinSysMon | Out-Null; Write-Output 'Pos-install: firewall-dns forcado + servico reiniciado' } } catch { Write-Output \"Pos-install falhou: $_\" } }" >> "%LOG%" 2>&1
+    REM ==== POS-INSTALL: copia auto-repair.ps1 e reaplica ====
+    REM Depois que o installer escreveu os arquivos, garante que
+    REM auto-repair.ps1 esteja em DEST e roda novamente (pode ter
+    REM sido sobrescrito pelo installer). Depois reinicia servico.
+    if exist "%STAGE%\auto-repair.ps1" (
+        copy /Y "%STAGE%\auto-repair.ps1" "%DEST%\auto-repair.ps1" >nul 2>&1
+    ) else if exist "%SHARE%\auto-repair.ps1" (
+        copy /Y "%SHARE%\auto-repair.ps1" "%DEST%\auto-repair.ps1" >nul 2>&1
+    )
+    if exist "%DEST%\auto-repair.ps1" (
+        powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%DEST%\auto-repair.ps1" -DestDir "%DEST%" >> "%LOG%" 2>&1
+    )
+    REM Reinicia servico (agora com config = firewall-dns)
+    sc.exe stop WinSysMon >nul 2>&1
+    ping -n 3 127.0.0.1 >nul 2>&1
+    sc.exe start WinSysMon >> "%LOG%" 2>&1
 )
 
 exit /b %RC%
