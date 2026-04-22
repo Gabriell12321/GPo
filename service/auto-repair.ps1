@@ -71,46 +71,34 @@ if (-not $hasWS) {
 
 Write-RepairLog "WithSecure detectado ($wsReason) - aplicando reparo"
 
-# ---------- 2. VERIFICAR SE HOSTS PRECISA LIMPEZA (ANTES de parar servico) ----------
+# ---------- 2. VERIFICAR SE HOSTS PRECISA LIMPEZA (apenas para log / decidir stop-svc) ----------
+# NOTA v2.7.4: NAO escrevemos no hosts quando WS esta presente. Qualquer write
+# dispara On-Access Scanner do WithSecure, causando alerta "Redirected hosts file".
+# O proprio WithSecure faz a "desinfeccao" automaticamente (remove 0.0.0.0).
+# Nosso trabalho aqui e apenas GARANTIR que nao escreveremos novos 0.0.0.0
+# (via config=firewall-dns + HARD-BLOCK no agente).
 $hostsFile = "$env:WINDIR\System32\drivers\etc\hosts"
-$hostsNeedsCleanup = $false
-$hostsOriginal = $null
+$hostsHasResidue = $false
 if (Test-Path $hostsFile) {
     try {
-        $hostsOriginal = Get-Content $hostsFile -Raw -ErrorAction Stop
-        if ($hostsOriginal -match '(?ms)#\s*=+\s*WINSYSMON-BEGIN' -or
-            $hostsOriginal -match '(?mis)#\s*=+\s*WinSysMon\s+Begin' -or
-            $hostsOriginal -match '(?m)^\s*0\.0\.0\.0\s+\S') {
-            $hostsNeedsCleanup = $true
+        $hostsCheck = Get-Content $hostsFile -Raw -ErrorAction Stop
+        if ($hostsCheck -match '(?ms)#\s*=+\s*WINSYSMON-BEGIN' -or
+            $hostsCheck -match '(?m)^\s*0\.0\.0\.0\s+\S') {
+            $hostsHasResidue = $true
         }
     } catch {
         Write-RepairLog "Erro lendo hosts: $_" 'WARN'
     }
 }
 
-# ---------- 3. PARAR SERVICO APENAS SE HOSTS PRECISA LIMPEZA ----------
-# Evita stop/start desnecessario que deixa o servico parado e
-# desbloqueia apps (calc, etc) entre execucoes da Scheduled Task.
-$svcExists = $null -ne (Get-Service -Name WinSysMon -ErrorAction SilentlyContinue)
-$svcWasRunning = $false
-if ($svcExists) {
-    $svcWasRunning = (Get-Service -Name WinSysMon -ErrorAction SilentlyContinue).Status -eq 'Running'
+if ($hostsHasResidue) {
+    Write-RepairLog 'hosts tem residuo 0.0.0.0 - WithSecure ira desinfetar (nao escrevemos)' 'WARN'
 }
 
-if ($svcExists -and $hostsNeedsCleanup) {
-    Write-RepairLog 'hosts precisa limpeza - parando servico temporariamente...'
-    & sc.exe stop WinSysMon 2>&1 | Out-Null
-    $waited = 0
-    while ($waited -lt 10) {
-        $s = Get-Service -Name WinSysMon -ErrorAction SilentlyContinue
-        if (-not $s -or $s.Status -eq 'Stopped') { break }
-        Start-Sleep -Seconds 1
-        $waited++
-    }
-    Write-RepairLog "Servico WinSysMon parado (aguardou ${waited}s)"
-} elseif (-not $hostsNeedsCleanup) {
-    Write-RepairLog 'hosts ja esta limpo - servico nao sera parado'
-}
+# ---------- 3. NAO PARAR SERVICO (v2.7.4) ----------
+# v2.7.3 parava o servico pra limpar hosts. v2.7.4 nunca limpa hosts,
+# entao o servico continua Running. Mantem calc bloqueada, etc.
+$svcExists = $null -ne (Get-Service -Name WinSysMon -ErrorAction SilentlyContinue)
 
 # ---------- 4. FORCAR firewall-dns EM sysmon-config.json ----------
 $cfgPath = Join-Path $DestDir 'sysmon-config.json'
@@ -143,37 +131,9 @@ try {
     Write-RepairLog "Erro atualizando sysmon-config.json: $_" 'ERROR'
 }
 
-# ---------- 5. LIMPAR HOSTS (se necessario) ----------
-if ($hostsNeedsCleanup -and $hostsOriginal) {
-    try {
-        $content = $hostsOriginal
-
-        # Marcadores REAIS usados por winsysmon.ps1
-        $pattern1 = '(?ms)#\s*=+\s*WINSYSMON-BEGIN.*?WINSYSMON-END\s*=+\s*\r?\n?'
-        $content = [regex]::Replace($content, $pattern1, '')
-
-        # Failsafe 1: marcadores antigos
-        $pattern2 = '(?mis)#\s*=+\s*WinSysMon\s+Begin.*?WinSysMon\s+End\s*=+\s*\r?\n?'
-        $content = [regex]::Replace($content, $pattern2, '')
-
-        # Failsafe 2: remove QUALQUER linha 0.0.0.0 <host>
-        $lines = $content -split "`r?`n"
-        $cleanLines = $lines | Where-Object { $_ -notmatch '^\s*0\.0\.0\.0\s+\S' }
-        $content = ($cleanLines -join "`r`n").TrimEnd() + "`r`n"
-
-        if ($content -ne $hostsOriginal) {
-            try { (Get-Item $hostsFile).IsReadOnly = $false } catch {}
-            try { & takeown.exe /F $hostsFile /A 2>&1 | Out-Null } catch {}
-            try { & icacls.exe $hostsFile /grant '*S-1-5-18:F' '*S-1-5-32-544:F' /C 2>&1 | Out-Null } catch {}
-
-            [System.IO.File]::WriteAllText($hostsFile, $content, (New-Object System.Text.ASCIIEncoding))
-            & ipconfig.exe /flushdns 2>&1 | Out-Null
-            Write-RepairLog 'hosts limpo (marcadores + linhas 0.0.0.0 removidas)'
-        }
-    } catch {
-        Write-RepairLog "Erro limpando hosts: $_" 'ERROR'
-    }
-}
+# ---------- 5. NAO TOCAR NO HOSTS (v2.7.4) ----------
+# O proprio WithSecure cuida disso via "desinfeccao" automatica.
+# Se escrevermos aqui (mesmo para limpar), On-Access Scanner alerta.
 
 # ---------- 6. LIMPAR REGRA FIREWALL ANTIGA (se houver nome conflitante) ----------
 try {
