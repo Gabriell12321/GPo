@@ -1,6 +1,6 @@
 @echo off
 REM ============================================================
-REM  PARAGPOAA.BAT v2.6.4 - Deploy WinSysMon via GPO Startup
+REM  PARAGPOAA.BAT v2.6.5 - Deploy WinSysMon via GPO Startup
 REM  Executa como SYSTEM. Idempotente com sentinel de versao.
 REM
 REM  v2.6.4: substitui robocopy por copy direto (mais robusto
@@ -9,7 +9,7 @@ REM  powershell.exe -File com UNC contendo espacos.
 REM ============================================================
 setlocal enableextensions enabledelayedexpansion
 
-set "VERSION=2.6.4"
+set "VERSION=2.6.5"
 
 set "SHARE=\\srv-105\aaa$\service"
 set "SHARE_LEGACY=\\srv-105\Sistema de monitoramento\gpo\aaa\service"

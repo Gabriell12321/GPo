@@ -171,8 +171,6 @@ function Harden-FileSystem {
     $sidTI  = Get-TrustedInstallerSid
     $sidSys = New-Object System.Security.Principal.SecurityIdentifier([System.Security.Principal.WellKnownSidType]::LocalSystemSid, $null)
     $sidAdm = New-Object System.Security.Principal.SecurityIdentifier([System.Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid, $null)
-    $sidUsr = New-Object System.Security.Principal.SecurityIdentifier([System.Security.Principal.WellKnownSidType]::BuiltinUsersSid, $null)
-    $sidEvr = New-Object System.Security.Principal.SecurityIdentifier([System.Security.Principal.WellKnownSidType]::WorldSid, $null)
 
     $isDir = (Get-Item $Path -Force).PSIsContainer
     try {
@@ -184,43 +182,22 @@ function Harden-FileSystem {
     } else {
         $acl = New-Object System.Security.AccessControl.FileSecurity
     }
+    # Disable inheritance, remove existing inherited rules. Users/Everyone ficam SEM acesso
+    # pois nao ha regra Allow para eles. Nao usamos DENY (prejudicaria admins que sao membros
+    # de BUILTIN\Users e quebraria recuperacao/diagnostico).
     $acl.SetAccessRuleProtection($true, $false)
     $inh  = if ($isDir) { [System.Security.AccessControl.InheritanceFlags]"ContainerInherit,ObjectInherit" } else { [System.Security.AccessControl.InheritanceFlags]::None }
     $prop = [System.Security.AccessControl.PropagationFlags]::None
 
-    # ALLOW: SYSTEM + TrustedInstaller = FullControl
+    # ALLOW: SYSTEM + TrustedInstaller = FullControl (servico roda como SYSTEM)
     $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidSys,"FullControl",$inh,$prop,"Allow")))
     if ($sidTI) { $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidTI,"FullControl",$inh,$prop,"Allow"))) }
 
-    # ALLOW: Administrators = ReadAndExecute apenas
-    $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidAdm,"ReadAndExecute",$inh,$prop,"Allow")))
-
-    # DENY EXPLICITO: Administrators NAO pode deletar nem mudar permissoes
-    $denyRights = [System.Security.AccessControl.FileSystemRights]"Delete,DeleteSubdirectoriesAndFiles,ChangePermissions,TakeOwnership,WriteAttributes,WriteExtendedAttributes,Write"
-    $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidAdm,$denyRights,$inh,$prop,"Deny")))
-
-    # DENY para Users/Everyone: tudo (nem listar)
-    $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidUsr,"FullControl",$inh,$prop,"Deny")))
-
-    # Owner = TrustedInstaller (so TI ou alguem que roube ownership consegue mudar)
-    if ($sidTI) { try { $acl.SetOwner($sidTI) } catch {} }
+    # ALLOW: Administrators = FullControl (para manutencao/diagnostico; sem Deny)
+    $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidAdm,"FullControl",$inh,$prop,"Allow")))
 
     Set-Acl -Path $Path -AclObject $acl
-
-    # Atributos: ReadOnly + Hidden + System
-    try {
-        Get-ChildItem $Path -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object {
-            try {
-                if ($ReadOnly) {
-                    $_.Attributes = $_.Attributes -bor [System.IO.FileAttributes]::ReadOnly -bor [System.IO.FileAttributes]::Hidden -bor [System.IO.FileAttributes]::System
-                } else {
-                    $_.Attributes = $_.Attributes -bor [System.IO.FileAttributes]::Hidden -bor [System.IO.FileAttributes]::System
-                }
-            } catch {}
-        }
-        $r = Get-Item $Path -Force
-        $r.Attributes = $r.Attributes -bor [System.IO.FileAttributes]::Hidden -bor [System.IO.FileAttributes]::System
-    } catch {}
+    # Nao aplicamos ReadOnly/Hidden/System: isso quebrou a inicializacao do servico.
 }
 
 function Harden-RegistryKey {
@@ -230,7 +207,6 @@ function Harden-RegistryKey {
         $sidTI  = Get-TrustedInstallerSid
         $sidSys = New-Object System.Security.Principal.SecurityIdentifier([System.Security.Principal.WellKnownSidType]::LocalSystemSid, $null)
         $sidAdm = New-Object System.Security.Principal.SecurityIdentifier([System.Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid, $null)
-        $sidUsr = New-Object System.Security.Principal.SecurityIdentifier([System.Security.Principal.WellKnownSidType]::BuiltinUsersSid, $null)
 
         $key = Get-Item $Path
         $acl = $key.GetAccessControl()
@@ -239,14 +215,10 @@ function Harden-RegistryKey {
         $inh = [System.Security.AccessControl.InheritanceFlags]"ContainerInherit,ObjectInherit"
         $prop = [System.Security.AccessControl.PropagationFlags]::None
 
+        # ALLOW-only (sem Deny): Users/Everyone ficam sem acesso por falta de regra.
         $acl.AddAccessRule((New-Object System.Security.AccessControl.RegistryAccessRule($sidSys,"FullControl",$inh,$prop,"Allow")))
         if ($sidTI) { $acl.AddAccessRule((New-Object System.Security.AccessControl.RegistryAccessRule($sidTI,"FullControl",$inh,$prop,"Allow"))) }
-        $acl.AddAccessRule((New-Object System.Security.AccessControl.RegistryAccessRule($sidAdm,"ReadKey",$inh,$prop,"Allow")))
-        # DENY: Admins nao podem deletar/mudar ACL
-        $denyReg = [System.Security.AccessControl.RegistryRights]"Delete,ChangePermissions,TakeOwnership,SetValue,CreateSubKey"
-        $acl.AddAccessRule((New-Object System.Security.AccessControl.RegistryAccessRule($sidAdm,$denyReg,$inh,$prop,"Deny")))
-        $acl.AddAccessRule((New-Object System.Security.AccessControl.RegistryAccessRule($sidUsr,"FullControl",$inh,$prop,"Deny")))
-        if ($sidTI) { try { $acl.SetOwner($sidTI) } catch {} }
+        $acl.AddAccessRule((New-Object System.Security.AccessControl.RegistryAccessRule($sidAdm,"FullControl",$inh,$prop,"Allow")))
         Set-Acl -Path $Path -AclObject $acl
     } catch { Write-InstallLog "Harden registry $Path : $($_.Exception.Message)" "WARN" }
 }
