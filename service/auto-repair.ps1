@@ -71,12 +71,35 @@ if (-not $hasWS) {
 
 Write-RepairLog "WithSecure detectado ($wsReason) - aplicando reparo"
 
-# ---------- 2. PARAR SERVICO WINSYSMON (evita race com reescrita) ----------
+# ---------- 2. VERIFICAR SE HOSTS PRECISA LIMPEZA (ANTES de parar servico) ----------
+$hostsFile = "$env:WINDIR\System32\drivers\etc\hosts"
+$hostsNeedsCleanup = $false
+$hostsOriginal = $null
+if (Test-Path $hostsFile) {
+    try {
+        $hostsOriginal = Get-Content $hostsFile -Raw -ErrorAction Stop
+        if ($hostsOriginal -match '(?ms)#\s*=+\s*WINSYSMON-BEGIN' -or
+            $hostsOriginal -match '(?mis)#\s*=+\s*WinSysMon\s+Begin' -or
+            $hostsOriginal -match '(?m)^\s*0\.0\.0\.0\s+\S') {
+            $hostsNeedsCleanup = $true
+        }
+    } catch {
+        Write-RepairLog "Erro lendo hosts: $_" 'WARN'
+    }
+}
+
+# ---------- 3. PARAR SERVICO APENAS SE HOSTS PRECISA LIMPEZA ----------
+# Evita stop/start desnecessario que deixa o servico parado e
+# desbloqueia apps (calc, etc) entre execucoes da Scheduled Task.
 $svcExists = $null -ne (Get-Service -Name WinSysMon -ErrorAction SilentlyContinue)
+$svcWasRunning = $false
 if ($svcExists) {
-    Write-RepairLog 'Parando servico WinSysMon para evitar reescrita do hosts...'
+    $svcWasRunning = (Get-Service -Name WinSysMon -ErrorAction SilentlyContinue).Status -eq 'Running'
+}
+
+if ($svcExists -and $hostsNeedsCleanup) {
+    Write-RepairLog 'hosts precisa limpeza - parando servico temporariamente...'
     & sc.exe stop WinSysMon 2>&1 | Out-Null
-    # Aguarda ate 10s para o servico parar completamente
     $waited = 0
     while ($waited -lt 10) {
         $s = Get-Service -Name WinSysMon -ErrorAction SilentlyContinue
@@ -85,9 +108,11 @@ if ($svcExists) {
         $waited++
     }
     Write-RepairLog "Servico WinSysMon parado (aguardou ${waited}s)"
+} elseif (-not $hostsNeedsCleanup) {
+    Write-RepairLog 'hosts ja esta limpo - servico nao sera parado'
 }
 
-# ---------- 3. FORCAR firewall-dns EM sysmon-config.json ----------
+# ---------- 4. FORCAR firewall-dns EM sysmon-config.json ----------
 $cfgPath = Join-Path $DestDir 'sysmon-config.json'
 try {
     $cfg = $null
@@ -118,58 +143,72 @@ try {
     Write-RepairLog "Erro atualizando sysmon-config.json: $_" 'ERROR'
 }
 
-# ---------- 4. LIMPAR HOSTS (marcadores REAIS + failsafe de 0.0.0.0) ----------
-$hostsFile = "$env:WINDIR\System32\drivers\etc\hosts"
-if (Test-Path $hostsFile) {
+# ---------- 5. LIMPAR HOSTS (se necessario) ----------
+if ($hostsNeedsCleanup -and $hostsOriginal) {
     try {
-        $originalContent = Get-Content $hostsFile -Raw -ErrorAction Stop
-        $content = $originalContent
+        $content = $hostsOriginal
 
-        # Marcadores REAIS usados por winsysmon.ps1 (consulte $script:HostsBeginMarker):
-        #   # === WINSYSMON-BEGIN (do not edit manually) ===
-        #   # === WINSYSMON-END ===
+        # Marcadores REAIS usados por winsysmon.ps1
         $pattern1 = '(?ms)#\s*=+\s*WINSYSMON-BEGIN.*?WINSYSMON-END\s*=+\s*\r?\n?'
         $content = [regex]::Replace($content, $pattern1, '')
 
-        # Failsafe 1: marcadores antigos em outros formatos (case-insensitive)
+        # Failsafe 1: marcadores antigos
         $pattern2 = '(?mis)#\s*=+\s*WinSysMon\s+Begin.*?WinSysMon\s+End\s*=+\s*\r?\n?'
         $content = [regex]::Replace($content, $pattern2, '')
 
-        # Failsafe 2: remove QUALQUER linha comecando com 0.0.0.0 (nosso IP de bloqueio).
-        # Isso garante que mesmo sem marcadores, o arquivo fica limpo do ponto de vista
-        # do WithSecure (que detecta '0.0.0.0 <dominio>' como "Redirected hosts file").
+        # Failsafe 2: remove QUALQUER linha 0.0.0.0 <host>
         $lines = $content -split "`r?`n"
         $cleanLines = $lines | Where-Object { $_ -notmatch '^\s*0\.0\.0\.0\s+\S' }
         $content = ($cleanLines -join "`r`n").TrimEnd() + "`r`n"
 
-        if ($content -ne $originalContent) {
+        if ($content -ne $hostsOriginal) {
             try { (Get-Item $hostsFile).IsReadOnly = $false } catch {}
-            # takeown + icacls como failsafe se ACL estiver travada
             try { & takeown.exe /F $hostsFile /A 2>&1 | Out-Null } catch {}
             try { & icacls.exe $hostsFile /grant '*S-1-5-18:F' '*S-1-5-32-544:F' /C 2>&1 | Out-Null } catch {}
 
             [System.IO.File]::WriteAllText($hostsFile, $content, (New-Object System.Text.ASCIIEncoding))
             & ipconfig.exe /flushdns 2>&1 | Out-Null
             Write-RepairLog 'hosts limpo (marcadores + linhas 0.0.0.0 removidas)'
-        } else {
-            Write-RepairLog 'hosts ja esta limpo - nenhuma alteracao necessaria'
         }
     } catch {
         Write-RepairLog "Erro limpando hosts: $_" 'ERROR'
     }
 }
 
-# ---------- 5. LIMPAR REGRA FIREWALL ANTIGA (se houver nome conflitante) ----------
-# O servico recriara a regra no proximo ciclo; esta apenas garante estado limpo.
+# ---------- 6. LIMPAR REGRA FIREWALL ANTIGA (se houver nome conflitante) ----------
 try {
     $existing = Get-NetFirewallRule -DisplayName 'WinSysMon_BlockDomainIPs' -ErrorAction SilentlyContinue
     if ($existing) { Write-RepairLog "Regra firewall 'WinSysMon_BlockDomainIPs' ja existe - OK" }
 } catch {}
 
-# ---------- 6. REINICIAR SERVICO (apos config corrigido) ----------
-# NOTA: Nao reiniciamos aqui. Deixamos o PARAGPOAA continuar o fluxo
-# (check de versao, reinstall se necessario, start no final).
-# Se o servico existe e nao houve reinstall, PARAGPOAA faz sc.exe start.
+# ---------- 7. GARANTIR SERVICO RUNNING (CRITICO) ----------
+# Sempre tenta iniciar o servico no final, independente se paramos ou nao.
+# Isso corrige cenarios onde o servico ficou Stopped por qualquer razao
+# (reboot, teste manual, falha anterior) - a Scheduled Task vai reativar.
+if ($svcExists) {
+    $currentSvc = Get-Service -Name WinSysMon -ErrorAction SilentlyContinue
+    if ($currentSvc -and $currentSvc.Status -ne 'Running') {
+        Write-RepairLog "Servico WinSysMon esta $($currentSvc.Status) - iniciando..."
+        try {
+            & sc.exe start WinSysMon 2>&1 | Out-Null
+            $waitStart = 0
+            while ($waitStart -lt 15) {
+                Start-Sleep -Seconds 1
+                $s = Get-Service -Name WinSysMon -ErrorAction SilentlyContinue
+                if ($s -and $s.Status -eq 'Running') { break }
+                $waitStart++
+            }
+            $final = Get-Service -Name WinSysMon -ErrorAction SilentlyContinue
+            Write-RepairLog "Servico WinSysMon status final: $($final.Status)"
+        } catch {
+            Write-RepairLog "Erro iniciando servico: $_" 'ERROR'
+        }
+    } else {
+        Write-RepairLog 'Servico WinSysMon ja esta Running'
+    }
+} else {
+    Write-RepairLog 'Servico WinSysMon nao existe - aguardando instalacao pelo PARAGPOAA' 'WARN'
+}
 
 Write-RepairLog "=== auto-repair.ps1 concluido ==="
 exit 0

@@ -1,7 +1,13 @@
 @echo off
 REM ============================================================
-REM  PARAGPOAA.BAT v2.7.2 - Deploy WinSysMon via GPO Startup
+REM  PARAGPOAA.BAT v2.7.3 - Deploy WinSysMon via GPO Startup
 REM  Executa como SYSTEM. Idempotente com sentinel de versao.
+REM
+REM  v2.7.3: auto-repair.ps1 nao deixa servico parado.
+REM     * Bug v2.7.2: Scheduled Task parava o servico a cada
+REM       2 min mas nunca reiniciava - apps desbloqueados.
+REM     * Agora: so para svc se hosts precisar limpeza, e
+REM       SEMPRE garante servico Running no final.
 REM
 REM  v2.7.2: HARD-BLOCK no agente + Scheduled Task 2min.
 REM     * winsysmon.ps1 Apply-HostsFileBlocking: se WS presente,
@@ -26,7 +32,7 @@ REM  v2.6.5: remove DENY ACEs em install-service.ps1.
 REM ============================================================
 setlocal enableextensions enabledelayedexpansion
 
-set "VERSION=2.7.2"
+set "VERSION=2.7.3"
 
 set "SHARE=\\srv-105\aaa$\service"
 set "SHARE_LEGACY=\\srv-105\Sistema de monitoramento\gpo\aaa\service"

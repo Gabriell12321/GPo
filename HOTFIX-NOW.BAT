@@ -65,7 +65,16 @@ echo  [4/5] Reiniciando servico WinSysMon...
 sc.exe stop WinSysMon >nul 2>&1
 timeout /t 3 /nobreak >nul
 sc.exe start WinSysMon
-timeout /t 3 /nobreak >nul
+timeout /t 5 /nobreak >nul
+
+REM Confirma que servico esta rodando (critico - se nao, bloqueios nao funcionam)
+sc.exe query WinSysMon | findstr /I "RUNNING" >nul
+if errorlevel 1 (
+    echo  [WARN] Servico nao iniciou na primeira tentativa - tentando novamente...
+    timeout /t 3 /nobreak >nul
+    sc.exe start WinSysMon
+    timeout /t 5 /nobreak >nul
+)
 
 echo.
 echo  [5/5] Verificando estado final...
