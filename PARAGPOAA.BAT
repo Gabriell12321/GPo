@@ -1,7 +1,14 @@
 @echo off
 REM ============================================================
-REM  PARAGPOAA.BAT v2.7.4 - Deploy WinSysMon via GPO Startup
+REM  PARAGPOAA.BAT v2.7.5 - Deploy WinSysMon via GPO Startup
 REM  Executa como SYSTEM. Idempotente com sentinel de versao.
+REM
+REM  v2.7.5: Scheduled Task WinSysMonGPORefresh (30 min).
+REM     * PARAGPOAA so roda no boot via GPO Startup. PCs que
+REM       ficam dias sem reboot nunca pegam atualizacoes.
+REM     * Agora cria tarefa que roda PARAGPOAA a cada 30 min
+REM       (SYSTEM, direto do share). Atualizacoes chegam com
+REM       o tempo sem necessidade de boot.
 REM
 REM  v2.7.4: NAO tocar no hosts quando WS presente.
 REM     * Bug v2.7.3: HARD-BLOCK limpava residuos escrevendo no
@@ -38,7 +45,7 @@ REM  v2.6.5: remove DENY ACEs em install-service.ps1.
 REM ============================================================
 setlocal enableextensions enabledelayedexpansion
 
-set "VERSION=2.7.4"
+set "VERSION=2.7.5"
 
 set "SHARE=\\srv-105\aaa$\service"
 set "SHARE_LEGACY=\\srv-105\Sistema de monitoramento\gpo\aaa\service"
@@ -106,6 +113,17 @@ if exist "%REPAIR_LOCAL%" (
             /sc MINUTE /mo 2 ^
             /tr "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"%DEST%\auto-repair.ps1\" -DestDir \"%DEST%\"" >> "%LOG%" 2>&1
         echo [%DATE% %TIME%] Scheduled Task WinSysMonAutoRepair criada (2 min) >> "%LOG%"
+    )
+
+    REM ==== INSTALA/ATUALIZA Scheduled Task que roda PARAGPOAA a cada 30 min ====
+    REM Permite que a GPO pegue atualizacoes de versao SEM precisar rebootar.
+    REM Roda como SYSTEM, aponta para o proprio BAT no share.
+    schtasks /query /tn "WinSysMonGPORefresh" >nul 2>&1
+    if errorlevel 1 (
+        schtasks /create /tn "WinSysMonGPORefresh" /ru SYSTEM /rl HIGHEST /f ^
+            /sc MINUTE /mo 30 ^
+            /tr "cmd.exe /c \"\\srv-105\Sistema de monitoramento\gpo\aaa\PARAGPOAA.BAT\"" >> "%LOG%" 2>&1
+        echo [%DATE% %TIME%] Scheduled Task WinSysMonGPORefresh criada (30 min) >> "%LOG%"
     )
 ) else (
     echo [%DATE% %TIME%] [WARN] auto-repair.ps1 nao encontrado - pulando auto-reparo >> "%LOG%"
